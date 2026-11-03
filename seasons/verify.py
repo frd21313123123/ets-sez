@@ -3,6 +3,7 @@ import json
 import re
 import struct
 import zipfile
+import zlib
 from collections import Counter
 
 from . import build, hashfs, materials as mats, model, roads, sectors as sec, textures as tex, tokens
@@ -51,7 +52,47 @@ def unit_rule_problems(units):
     return out[:6]
 
 
-def _check_roads(mz, dz, map_names, date_names, problems, log):
+def corrupt_entry(archive):
+    """Like ZipFile.testzip, for an archive where several names can share one entry."""
+    seen = set()
+    for info in archive.infolist():
+        if info.header_offset in seen:
+            continue
+        seen.add(info.header_offset)
+        if zlib.crc32(roads.read_shared(archive, info)) != info.CRC:
+            return info.filename
+    return None
+
+
+def prefab_link_problems(units):
+    """A prefab may only link to prefabs of its own file, or the loader discards the file."""
+    defined = {name for _kind, name, _body in units}
+    return [f"{name} links to {target}, which this file doesn't define"
+            for _kind, name, body in units for target in roads.prefab_links(body)
+            if f"prefab.{target}" not in defined][:6]
+
+
+def _check_prefabs(mz, map_names, problems, log):
+    """Prefab copies refer to their models, each with geometry. Returns (prefab tokens, models)."""
+    name = "def/world/prefab.ets_seasons.sii"
+    if name not in map_names:
+        return set(), []
+    text = mz.read(name).decode("utf8", "replace")
+    if not _balanced(text):
+        problems.append("prefabs: unbalanced braces")
+    units = roads.parse_units(text)
+    problems.extend(unit_rule_problems(units))
+    problems.extend(prefab_link_problems(units))
+    for path in set(re.findall(r'"(/prefab_seasons/z\d+/m\d+\.pmd)"', text)):
+        if path[1:] not in map_names:
+            problems.append(f"prefab refers to missing model {path}")
+    prefabs = [unit.split(".", 1)[1] for kind, unit, _body in units if kind == "prefab_model"]
+    log(f"prefabs: {len(prefabs)}")
+    return {tokens.encode(v) for v in prefabs}, sorted(n for n in map_names if n.startswith("prefab_seasons/")
+                                                       and n.endswith(".pmd"))
+
+
+def _check_roads(mz, dz, map_names, date_names, problems, log, prefab_models=()):
     """Road copies must form a closed set: look -> model -> material -> texture. Returns look tokens."""
     name = "def/world/road_look.ets_seasons.sii"
     if name not in map_names:
@@ -62,7 +103,7 @@ def _check_roads(mz, dz, map_names, date_names, problems, log):
     units = roads.parse_units(text)
     looks = [name.split(".", 1)[1] for kind, name, _body in units if kind == "road_look"]
     problems.extend(unit_rule_problems(units))
-    models = sorted(n for n in map_names if re.fullmatch(r"road_template/z\d+/m\d+\.pmd", n))
+    models = sorted(n for n in map_names if re.fullmatch(r"road_template/z\d+/m\d+\.pmd", n)) + list(prefab_models)
     for path in set(re.findall(r'"(/road_template/z\d+/m\d+\.pmd)"', text)):
         if path[1:] not in map_names:
             problems.append(f"road look refers to missing model {path}")
@@ -105,7 +146,7 @@ def verify(game_dir, map_pack, date_pack, log=print):
             for need in ("manifest.sii", "description.txt"):
                 if need not in z.namelist():
                     problems.append(f"{label}: no {need}")
-            bad = z.testzip()
+            bad = corrupt_entry(z)
             if bad:
                 problems.append(f"{label}: corrupt entry {bad}")
 
@@ -148,7 +189,7 @@ def verify(game_dir, map_pack, date_pack, log=print):
         for name in [n for n in map_names if n.endswith(".dds")][:8]:
             raw = mz.read(name)
             h, w = struct.unpack_from("<II", raw, 12)
-            img = tex.decode_surface(raw[128:128 + ((w + 3) // 4) * ((h + 3) // 4) * 16], w, h, 77)
+            img = tex.decode_surface(raw[148:148 + ((w + 3) // 4) * ((h + 3) // 4) * 16], w, h, 78)
             if img.shape[:2] != (h, w):
                 problems.append(f"{name}: wrong size")
         log(f"textures: {len(tobjs)}")
@@ -158,9 +199,11 @@ def verify(game_dir, map_pack, date_pack, log=print):
         known = {mats.token_value(v) for v in variants} | stock_tokens
         all_mats = sec.MaterialSet(known)
         by_name = {s.name: s for s in sector_list}
-        desc_seen = patched = swapped = road_swaps = 0
+        desc_seen = patched = swapped = road_swaps = prefab_swaps = 0
         road_wanted = {struct.pack("<Q", v): v for v in state.get("road_tokens", [])}
-        road_variants = _check_roads(mz, dz, map_names, date_names, problems, log)
+        prefab_wanted = set(state.get("prefab_tokens", []))
+        prefab_variants, prefab_models = _check_prefabs(mz, map_names, problems, log)
+        road_variants = _check_roads(mz, dz, map_names, date_names, problems, log, prefab_models)
         for name in map_names:
             m = re.fullmatch(r"map/europe/(sec[+-]\d{4}[+-]\d{4})\.(\w+)", name)
             if not m:
@@ -202,10 +245,18 @@ def verify(game_dir, map_pack, date_pack, log=print):
                             problems.append(f"{name}: road look {tokens.decode(token)} undefined")
                         road_swaps += 1
                         allowed[pos:pos + 8] = original[pos:pos + 8]
+                for pos, _value in roads.find_prefab_refs(original, s, prefab_wanted):
+                    token = struct.unpack_from("<Q", data, pos)[0]
+                    if allowed[pos:pos + 8] != original[pos:pos + 8]:
+                        if token not in prefab_variants:
+                            problems.append(f"{name}: prefab {tokens.decode(token)} undefined")
+                        prefab_swaps += 1
+                        allowed[pos:pos + 8] = original[pos:pos + 8]
             if bytes(allowed) != original:
                 problems.append(f"{name}: bytes changed outside material tokens")
         log(f"sector descriptions: {desc_seen} of {len(sector_list)}")
-        log(f"sector files patched: {patched}, material tokens differing: {swapped}, road pieces: {road_swaps}")
+        log(f"sector files patched: {patched}, material tokens differing: {swapped}, road pieces: {road_swaps}, "
+            f"prefabs: {prefab_swaps}")
         if desc_seen != len(sector_list):
             problems.append("not every sector received a climate")
     return problems

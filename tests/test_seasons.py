@@ -121,6 +121,12 @@ class TextureTests(unittest.TestCase):
         for cover in (0.25, 0.5, 0.75):
             self.assertAlmostEqual(textures.snow_mask(noise, cover).mean(), cover, delta=0.02)
 
+    def test_small_textures_still_bake(self):
+        base = np.full((32, 32, 4), 100, np.uint8)
+        noise = textures.road_noise(base)
+        self.assertEqual(noise.shape, (32, 32))
+        self.assertEqual(textures.resampled(noise, 64, 16).shape, (64, 16))
+
     def test_snow_levels_are_nested(self):
         noise = textures.periodic_noise(64)
         masks = [textures.snow_mask(noise, c) for c in (0.25, 0.5, 0.75, 1.0)]
@@ -128,8 +134,8 @@ class TextureTests(unittest.TestCase):
             self.assertTrue((less <= more + 1e-6).all())
 
     def test_tobj_layout_matches_game_sample(self):
-        # Header taken from a loose tobj shipped in a working mod.
-        sample = bytes.fromhex("010ab170" + "00" * 16 + "01000000" + "0200" + "030303" + "00" * 8 + "01" + "0000"
+        # Header taken from the game's own road and terrain tobj files.
+        sample = bytes.fromhex("010ab170" + "00" * 16 + "01000000" + "0200" + "010101" + "00" * 8 + "01" + "0000"
                                + "26" + "00" * 7)
         out = textures.write_tobj("/model2/props/garbage/debris_02_02.dds")
         self.assertEqual(out[:48], sample[:48])
@@ -144,7 +150,12 @@ class TextureTests(unittest.TestCase):
     def test_dds_size_is_consistent(self):
         data = textures.write_dds(self.gradient(32))
         self.assertEqual(data[:4], b"DDS ")
-        self.assertEqual(len(data), 128 + sum(len(textures.encode_bc3(m)) for m in textures.mip_chain(self.gradient(32))))
+        self.assertEqual(len(data), 148 + sum(len(textures.encode_bc3(m)) for m in textures.mip_chain(self.gradient(32))))
+
+    def test_dds_is_srgb_like_the_games_textures(self):
+        data = textures.write_dds(self.gradient(32))
+        self.assertEqual(data[84:88], b"DX10")
+        self.assertEqual(struct.unpack_from("<I", data, 128)[0], 78)
 
 
 if __name__ == "__main__":
