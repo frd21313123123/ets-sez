@@ -1,0 +1,9 @@
+# Generated / large / game-derived output: never commit
+build/
+__pycache__/
+*.pyc
+*.log
+.venv/
+venv/
+.idea/
+.vscode/
