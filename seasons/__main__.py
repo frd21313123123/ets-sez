@@ -19,7 +19,7 @@ def main():
     p.add_argument("--game", default=paths.game)
     sub = p.add_subparsers(dest="cmd", required=True)
     m = sub.add_parser("map", help="build the map pack from the game's files")
-    m.add_argument("--top", type=int, default=300, help="terrain materials that receive snow")
+    m.add_argument("--top", type=int, default=800, help="terrain materials that receive snow")
     m.add_argument("--textures", default=None, help="folder of game files extracted with SCS's tool")
     sub.add_parser("verify", help="check the built packs against the game's files")
     d = sub.add_parser("date", help="build the date pack")

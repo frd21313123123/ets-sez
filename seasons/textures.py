@@ -248,11 +248,13 @@ def road_noise(base, seed=23):
     """
     h, w = base.shape[:2]
     streaks = _fractal(h, w, np.random.default_rng(seed), stretch=5.0, lowest=10.0)
-    columns = base[:, :, :3].astype(np.float32).mean(axis=(0, 2))
-    near = _smooth_columns(columns, w // 128)
-    wear = _smooth_columns(columns, w // 4) - near
+    columns = _smooth_columns(base[:, :, :3].astype(np.float32).mean(axis=(0, 2)), w // 128)
+    # A median ignores a step in brightness, such as the edge of a shoulder, but not a narrow band.
+    reach = max(3, w // 3) | 1
+    wrapped = np.concatenate([columns[-(reach // 2):], columns, columns[:reach // 2]])
+    wear = np.median(np.lib.stride_tricks.sliding_window_view(wrapped, reach), axis=1) - columns
     wear = np.clip(wear / max(wear.std(), WEAR_FLOOR), -2.0, 2.0)
-    return _uniform(streaks + 0.9 * wear[None, :]).reshape(h, w)
+    return _uniform(streaks + 0.6 * wear[None, :]).reshape(h, w)
 
 
 def _uniform(values):
@@ -271,6 +273,13 @@ def packed_snow(h, w, rgb, seed=31):
     color = np.clip(np.array(rgb, np.float32)[None, None, :] + shade, 0, 255)
     alpha = np.clip(ROAD_SNOW_ALPHA + broad * 5.0, 0, 255)[:, :, None]
     return np.concatenate([color, alpha], axis=2).astype(np.uint8)
+
+
+def resampled(noise, h, w):
+    """The same pattern for a texture of another size."""
+    ny = (np.arange(h) * noise.shape[0] // h)[:, None]
+    nx = (np.arange(w) * noise.shape[1] // w)[None, :]
+    return noise[ny, nx]
 
 
 def snow_mask(noise, cover, softness=0.07):

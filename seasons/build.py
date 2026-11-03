@@ -153,7 +153,7 @@ def stock_climate_weights(files):
 
 def _patch_sector(job):
     """Worker: patch one sector's files. Runs in a separate process."""
-    path, name, x, z, position, known, zones, indices, road_index = job
+    path, name, x, z, position, known, zones, indices, road_index, prefab_index = job
     archive = hashfs.Archive(path)
     token_set = sec.MaterialSet(known)
     low = min(int(position), model.ZONE_COUNT - 2)
@@ -167,7 +167,7 @@ def _patch_sector(job):
         return tokens.encode(mats.variant_name(zone, idx))
 
     out = {}
-    swapped = road_total = 0
+    swapped = road_total = prefab_total = 0
     for kind in sec.SECTOR_KINDS:
         data = archive.read(f"map/europe/{name}.{kind}")
         if not data:
@@ -180,13 +180,18 @@ def _patch_sector(job):
             patched, road_swaps = roads.patch_refs(patched, refs, low, frac, road_index, zones)
             n += road_swaps
             road_total += road_swaps
+        if kind == "base" and prefab_index:
+            refs = roads.find_prefab_refs(data, sec.Sector(x, z, name, None), set(prefab_index))
+            patched, prefab_swaps = roads.patch_prefab_refs(data, patched, refs, low, frac, prefab_index, zones)
+            n += prefab_swaps
+            prefab_total += prefab_swaps
         if n:
             out[kind] = patched
             swapped += n
-    return name, out, swapped, road_total
+    return name, out, swapped, road_total, prefab_total
 
 
-def build_map_pack(game_dir, out_path, top=300, textures_dir=None, workers=None, log=print):
+def build_map_pack(game_dir, out_path, top=800, textures_dir=None, workers=None, log=print):
     started = time.time()
     files = hashfs.GameFiles(game_dir)
     sector_list = sec.list_sectors(files)
@@ -238,10 +243,10 @@ def build_map_pack(game_dir, out_path, top=300, textures_dir=None, workers=None,
         lines.append("}\n")
         zf.writestr("def/world/detail_vegetation_def.ets_seasons.sii", "".join(lines))
 
-        road_index, road_records = {}, []
+        road_index, prefab_index, road_records = {}, {}, []
         if textures_dir:
-            road_index, road_records = roads.build_into(zf, files, sector_list, positions, zones, textures_dir,
-                                                        read_extracted, log)
+            road_index, prefab_index, road_records = roads.build_into(zf, files, sector_list, positions, zones,
+                                                                      textures_dir, read_extracted, log)
 
         jobs = []
         for s in sector_list:
@@ -253,25 +258,28 @@ def build_map_pack(game_dir, out_path, top=300, textures_dir=None, workers=None,
             low = min(int(positions[s.name]), model.ZONE_COUNT - 2)
             if low in zones or low + 1 in zones:
                 jobs.append((s.archive.path, s.name, s.x, s.z, positions[s.name], known, set(zones), indices,
-                             road_index))
+                             road_index, prefab_index))
 
-        swapped = road_swaps = done = 0
+        swapped = road_swaps = prefab_swaps = done = 0
         with ProcessPoolExecutor(max_workers=workers) as pool:
-            for name, out, n, roads_here in pool.map(_patch_sector, jobs, chunksize=4):
+            for name, out, n, roads_here, prefabs_here in pool.map(_patch_sector, jobs, chunksize=4):
                 for kind, data in out.items():
                     zf.writestr(f"map/europe/{name}.{kind}", data)
                 swapped += n
                 road_swaps += roads_here
+                prefab_swaps += prefabs_here
                 done += 1
                 if done % 100 == 0:
                     log(f"  sectors patched: {done}/{len(jobs)}")
-        log(f"sectors patched: {done}, references swapped: {swapped}, of them road pieces: {road_swaps}")
+        log(f"sectors patched: {done}, references swapped: {swapped}, "
+            f"of them road pieces: {road_swaps}, prefabs: {prefab_swaps}")
 
     state = {
         **_field_entries(sector_list, located, positions),
         "game_stamp": game_stamp(game_dir),
         "road_materials": road_records,
         "road_tokens": sorted(road_index),
+        "prefab_tokens": sorted(prefab_index),
         "zones": zones,
         "climate_weights": stock_climate_weights(files),
         "materials": [{"name": m.name, "path": m.path, "base_texture": m.base_texture,
