@@ -10,6 +10,16 @@ SNOW_RGB = (200, 205, 211)
 SNOW_ALPHA = 40
 ROAD_SNOW_ALPHA = 30  # its share of the specular: asphalt holds about 20, the game's terrain snow 123
 WEAR_FLOOR = 1.5      # brightness difference across columns that still counts as a wheel path
+RUT_WIDTH_M = 0.28    # half width of a wheel track
+RUT_WANDER_M = 0.07   # how far a track wanders from its line
+RUT_DEPTH = 3.0       # against streaks of unit variance: tracks are the last to get snow
+RUT_STREAK_SHARE = 0.45
+RUT_DARKENING = 0.42  # packed snow in a track against fresh snow beside it
+RUT_GLOSS = 45
+MULT_NEUTRAL = 188.0  # sRGB value of 0.5 in linear light
+TREE_SNOW_RGB = (214, 220, 228)
+SOLID_MIP = 4         # 1/16 of a texture's width, wider than twigs but narrower than a bark strip
+BARK_SNOW = 0.12
 
 
 def _rgb565(c):
@@ -51,13 +61,23 @@ def _decode_alpha(blocks):
     return np.take_along_axis(pal, idx, axis=1)
 
 
+def _bc1_alpha(blocks):
+    """BC1 can hold one bit of alpha: index 3 of a block whose first colour isn't the larger one."""
+    c0 = blocks[:, 0].astype(np.int32) | blocks[:, 1].astype(np.int32) << 8
+    c1 = blocks[:, 2].astype(np.int32) | blocks[:, 3].astype(np.int32) << 8
+    bits = blocks[:, 4].astype(np.int64) | blocks[:, 5].astype(np.int64) << 8 | \
+        blocks[:, 6].astype(np.int64) << 16 | blocks[:, 7].astype(np.int64) << 24
+    idx = (bits[:, None] >> (np.arange(16) * 2)) & 3
+    return np.where((c0 <= c1)[:, None] & (idx == 3), 0, 255).astype(np.int32)
+
+
 def decode_surface(data, width, height, dxgi_format):
     """Decode tightly packed blocks to an (h, w, 4) uint8 image."""
     bw, bh = (width + 3) // 4, (height + 3) // 4
     size = 8 if dxgi_format in BC1_FORMATS else 16
     raw = np.frombuffer(data, dtype=np.uint8, count=bw * bh * size).reshape(-1, size)
     if dxgi_format in BC1_FORMATS:
-        rgb, a = _decode_colors(raw), np.full((bw * bh, 16), 255, np.int32)
+        rgb, a = _decode_colors(raw), _bc1_alpha(raw)
     else:
         rgb, a = _decode_colors(raw[:, 8:]), _decode_alpha(raw[:, :8])
     px = np.concatenate([rgb, a[:, :, None]], axis=2).reshape(bh, bw, 4, 4, 4)
@@ -65,10 +85,10 @@ def decode_surface(data, width, height, dxgi_format):
     return img[:height, :width].astype(np.uint8)
 
 
-def read_dds(data, want_width):
-    """Decode the mip nearest to want_width from DDS bytes. None if the format is unsupported."""
+def _dds_mips(data):
+    """(width, height, format, block bytes) of each mip in DDS bytes. Empty if the format is unsupported."""
     if data[:4] != b"DDS ":
-        return None
+        return
     h, w = struct.unpack_from("<II", data, 12)
     mips = max(1, struct.unpack_from("<I", data, 28)[0])
     fourcc = data[84:88]
@@ -81,16 +101,30 @@ def read_dds(data, want_width):
         fmt = struct.unpack_from("<I", data, 128)[0]
         pos = 148
     else:
-        return None
+        return
     if fmt not in BC1_FORMATS | BC3_FORMATS:
-        return None
+        return
     size = 8 if fmt in BC1_FORMATS else 16
     for level in range(mips):
         lw, lh = max(1, w >> level), max(1, h >> level)
         length = ((lw + 3) // 4) * ((lh + 3) // 4) * size
-        if lw <= want_width:
-            return decode_surface(data[pos:pos + length], lw, lh, fmt)
+        if pos + length > len(data):
+            return
+        yield lw, lh, fmt, data[pos:pos + length]
         pos += length
+
+
+def read_dds_chain(data, want_width):
+    """Decode every mip from the one nearest to want_width down. None if the format is unsupported."""
+    chain = [decode_surface(raw, lw, lh, fmt) for lw, lh, fmt, raw in _dds_mips(data) if lw <= want_width]
+    return chain or None
+
+
+def read_dds(data, want_width):
+    """Decode the mip nearest to want_width from DDS bytes. None if the format is unsupported."""
+    for lw, lh, fmt, raw in _dds_mips(data):
+        if lw <= want_width:
+            return decode_surface(raw, lw, lh, fmt)
     return None
 
 
@@ -178,10 +212,13 @@ def mip_chain(img):
     return chain
 
 
-def write_dds(img):
-    """Return sRGB BC3 DDS bytes with a full mip chain for an (h, w, 4) image, as the game's own textures are."""
+def write_dds(img, chain=None):
+    """Return sRGB BC3 DDS bytes with a full mip chain for an (h, w, 4) image, as the game's own textures are.
+
+    A `chain` given by the caller is written as it is, for textures whose lower mips must not be averaged.
+    """
     h, w = img.shape[:2]
-    chain = mip_chain(img)
+    chain = mip_chain(img) if chain is None else chain
     header = struct.pack(
         "<4s7I44x2I4s5I5I", b"DDS ", 124, 0x000A1007, h, w, max(1, (w + 3) // 4) * max(1, (h + 3) // 4) * 16,
         0, len(chain), 32, 0x4, b"DX10", 0, 0, 0, 0, 0, 0x401008, 0, 0, 0, 0)
@@ -238,16 +275,40 @@ def _smooth_columns(columns, width):
     return np.convolve(wrapped, np.ones(width) / width, mode="same")[n:2 * n]
 
 
-def road_noise(base, seed=23):
+def rut_field(h, w, ruts, per_metre, seed=41):
+    """How deep in a wheel track each texel lies, 0..1. `ruts` are U positions of the track centres.
+
+    Each track wanders a little along the road, with whole waves per repeat so the texture stays
+    seamless, and with a wave of its own so that the tracks of a pair don't move in step.
+    """
+    rng = np.random.default_rng(seed)
+    v = np.arange(h, dtype=np.float32)[:, None] / h
+    u = np.arange(w, dtype=np.float32)[None, :] / w
+    field = np.zeros((h, w), np.float32)
+    half_width = RUT_WIDTH_M * per_metre
+    wander = RUT_WANDER_M * per_metre
+    for centre in ruts:
+        drift = np.zeros_like(v)
+        for wave, share in ((1, 0.6), (2, 0.3), (5, 0.1)):
+            drift += share * np.sin(2 * np.pi * (wave * v + rng.random()))
+        off = (u - centre - wander * drift + 0.5) % 1.0 - 0.5
+        field = np.maximum(field, np.exp(-(off / half_width) ** 2))
+    return field
+
+
+def road_noise(base, seed=23, ruts=None, per_metre=None):
     """Threshold map for a road texture, whose U axis runs across the road and V along it.
 
-    Snow gathers in streaks along the road and stays out of darker wheel paths. A texture spans
-    the whole width of a road, so only the difference from the nearby columns counts as wear: a
-    side that is merely darker overall must not lose its snow. Like periodic_noise the result is
-    uniform, so a threshold equals exact coverage.
+    Snow gathers in streaks along the road. With known wheel tracks it stays out of them first, so
+    every level shows a pair of tracks per lane. Otherwise only the darker bands of the texture
+    tell where wheels go, and a texture spans the whole width of a road, so only the difference
+    from the nearby columns counts as wear: a side that is merely darker overall must not lose its
+    snow. Like periodic_noise the result is uniform, so a threshold equals exact coverage.
     """
     h, w = base.shape[:2]
     streaks = _fractal(h, w, np.random.default_rng(seed), stretch=5.0, lowest=10.0)
+    if ruts:
+        return _uniform(streaks * RUT_STREAK_SHARE + rut_field(h, w, ruts, per_metre) * RUT_DEPTH).reshape(h, w)
     columns = _smooth_columns(base[:, :, :3].astype(np.float32).mean(axis=(0, 2)), w // 128)
     # A median ignores a step in brightness, such as the edge of a shoulder, but not a narrow band.
     reach = max(3, w // 3) | 1
@@ -302,10 +363,12 @@ def bake(base, snow, noise, cover):
     return np.clip(out + 0.5, 0, 255).astype(np.uint8)
 
 
-def bake_road(base, snow, noise, cover):
-    """Snow on a road surface: all three images have the same size.
+def bake_road(base, snow, noise, cover, rut=None):
+    """Snow on a road surface: all the images have the same size.
 
-    Where it thins out the snow is dirtier, and the bare asphalt next to it is wet: darker and glossier.
+    Where it thins out the snow is dirtier, and the bare asphalt next to it is wet: darker and
+    glossier. In a wheel track what snow remains is packed: grey and slick, so tracks still show
+    where the snow has covered them.
     """
     mask = snow_mask(noise, cover)[:, :, None]
     deep = snow_mask(noise, max(0.0, cover - 0.12), 0.12)[:, :, None]
@@ -315,6 +378,10 @@ def bake_road(base, snow, noise, cover):
     bare[:, :, 3:] += 30 * wet
     top = snow.astype(np.float32)
     top[:, :, :3] *= 0.86 + 0.14 * deep
+    if rut is not None:
+        pressed = rut[:, :, None]
+        top[:, :, :3] *= 1 - RUT_DARKENING * pressed
+        top[:, :, 3:] += RUT_GLOSS * pressed
     out = bare * (1 - mask) + top * mask
     return np.clip(out + 0.5, 0, 255).astype(np.uint8)
 
@@ -323,6 +390,62 @@ def fade_decal(decal, cover):
     """A dark road decal under snow: its opacity goes as the road's snow comes."""
     out = decal.copy()
     out[:, :, 3] = (out[:, :, 3] * (1.0 - cover)).astype(np.uint8)
+    return out
+
+
+def neutral_mult(mult, cover):
+    """A detail texture multiplied over a road would darken its snow, so it fades to no effect.
+
+    It tiles at another scale than the snow pattern, so this can't follow the snow's shape.
+    The shader doubles it after reading sRGB, which makes this value leave the colour unchanged.
+    """
+    out = mult.astype(np.float32)
+    out[:, :, :3] += (MULT_NEUTRAL - out[:, :, :3]) * cover
+    return np.clip(out + 0.5, 0, 255).astype(np.uint8)
+
+
+def _exposed(chain, h, w):
+    """How much snow a part of a tree atlas can hold, 0..1.
+
+    Leaves and twigs have see-through texels around them, while bark is a solid block. A lower mip
+    shows the difference, as its alpha is high only where everything around a texel is opaque.
+    """
+    level = chain[min(SOLID_MIP, len(chain) - 1)]
+    ys = (np.arange(h) * level.shape[0] // h)[:, None]
+    xs = (np.arange(w) * level.shape[1] // w)[None, :]
+    solid = np.clip((level[ys, xs, 3].astype(np.float32) - 200) / 50, 0, 1)
+    return 1 - (1 - BARK_SNOW) * solid
+
+
+def bake_cut_out(chain, cover, seed=53):
+    """Snow on something with a cut out shape, such as leaves: the colour changes, the shape doesn't.
+
+    Each mip keeps the game's own alpha, as averaging it again would thin out trees in the distance.
+    Lighter parts take snow first, which are the ones facing up in tree textures.
+    """
+    top = chain[0]
+    h, w = top.shape[:2]
+    rgb = top[:, :, :3].astype(np.float32)
+    light = rgb.mean(axis=2)
+    spread = max(float(light.std()), 1.0)
+    noise = _fractal(h, w, np.random.default_rng(seed), lowest=4.0, slope=1.2)
+    threshold = _uniform(noise - 0.8 * (light - light.mean()) / spread).reshape(h, w)
+    mask = snow_mask(threshold, cover) * _exposed(chain, h, w)
+    masks = [mask]
+    while len(masks) < len(chain):
+        cur = masks[-1]
+        ch, cw = chain[len(masks)].shape[:2]
+        ys = (np.arange(ch) * cur.shape[0] // ch)[:, None]
+        xs = (np.arange(cw) * cur.shape[1] // cw)[None, :]
+        ys2 = ((np.arange(ch) * 2 + 1) * cur.shape[0] // (2 * ch))[:, None]
+        xs2 = ((np.arange(cw) * 2 + 1) * cur.shape[1] // (2 * cw))[None, :]
+        masks.append((cur[ys, xs] + cur[ys2, xs2] + cur[ys, xs2] + cur[ys2, xs]) / 4)
+    white = np.array(TREE_SNOW_RGB, np.float32)
+    out = []
+    for level, m in zip(chain, masks):
+        painted = level.astype(np.float32)
+        painted[:, :, :3] += (white - painted[:, :, :3]) * m[:, :, None]
+        out.append(np.clip(painted + 0.5, 0, 255).astype(np.uint8))
     return out
 
 

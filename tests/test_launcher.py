@@ -23,7 +23,8 @@ user_profile : _nameless.0.1 {
 }
 }
 """
-OURS = ['ets_seasons_map|Seasons: map data', 'ets_seasons_date|Seasons: date']
+OURS = ['ets_seasons_map|Seasons: map data', 'ets_seasons_roads|Seasons: roads', 'ets_seasons_roads2|Seasons: roads 2',
+        'ets_seasons_nature|Seasons: nature', 'ets_seasons_date|Seasons: date']
 
 
 class ScscTests(unittest.TestCase):
@@ -55,8 +56,8 @@ class ArrangeTests(unittest.TestCase):
     def test_season_mods_go_on_top_and_others_keep_order(self):
         text = profiles.arrange(SAMPLE)
         self.assertEqual(profiles.read_mods(text), ["base_map|Base map", "map_fix|Map fix"] + OURS)
-        self.assertIn("active_mods: 4", text)
-        self.assertIn('active_mods[3]: "ets_seasons_date|Seasons: date"', text)
+        self.assertIn(f"active_mods: {2 + len(OURS)}", text)
+        self.assertIn(f'active_mods[{1 + len(OURS)}]: "ets_seasons_date|Seasons: date"', text)
 
     def test_repeating_changes_nothing(self):
         once = profiles.arrange(SAMPLE)
@@ -74,7 +75,7 @@ class ArrangeTests(unittest.TestCase):
     def test_windows_line_endings_survive(self):
         text = profiles.arrange(SAMPLE.replace("\n", "\r\n"))
         self.assertEqual(text.count("\n"), text.count("\r\n"))
-        self.assertEqual(len(profiles.read_mods(text)), 4)
+        self.assertEqual(len(profiles.read_mods(text)), 2 + len(OURS))
 
     def test_no_mod_list_is_an_error(self):
         with self.assertRaises(ValueError):
@@ -211,8 +212,9 @@ class PrepareTests(unittest.TestCase):
         self.paths = Paths(game=os.path.join(self.dir, "game"), docs=os.path.join(self.dir, "docs"),
                            out=os.path.join(self.dir, "out"))
         os.makedirs(self.paths.out)
-        with open(self.paths.map_pack, "wb") as fh:
-            fh.write(b"map")
+        for pack in self.paths.map_packs:
+            with open(pack, "wb") as fh:
+                fh.write(b"map")
         self.state = {"zones": [], "materials": [], "climate_weights": {}}
 
     def test_stops_when_the_game_is_running(self):
@@ -228,11 +230,19 @@ class PrepareTests(unittest.TestCase):
     def test_installs_mods_and_arranges_a_new_profile(self):
         with mock.patch.object(session, "game_running", return_value=False):
             profile = session.prepare(self.paths, self.state, dt.date(2027, 1, 20), "Сезоны")
-        self.assertEqual(sorted(os.listdir(self.paths.mods)), ["ets_seasons_date.scs", "ets_seasons_map.scs"])
+        self.assertEqual(sorted(os.listdir(self.paths.mods)),
+                         sorted(f"{mod.split('|')[0]}.scs" for mod in OURS))
         self.assertEqual(profile.mods, OURS)
         listed = profiles.list_profiles(self.paths.profiles)
         self.assertEqual([p.name for p in listed], ["Сезоны"])
         self.assertEqual(listed[0].mods, OURS)
+
+    def test_a_build_with_a_pack_missing_counts_as_not_built(self):
+        with open(self.paths.state, "w", encoding="utf8") as fh:
+            json.dump(self.state, fh)
+        self.assertEqual(session.load_state(self.paths), self.state)
+        os.remove(self.paths.nature_pack)
+        self.assertIsNone(session.load_state(self.paths))
 
     def test_state_file_records_field_only_once(self):
         with open(self.paths.state, "w", encoding="utf8") as fh:

@@ -8,6 +8,8 @@ ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 GAME_FOLDER = os.path.join("steamapps", "common", "Euro Truck Simulator 2")
 FALLBACK_GAME = os.path.join(r"D:\SteamLibrary", GAME_FOLDER)
 MAP_PACK = "ets_seasons_map.scs"
+ROAD_PACKS = ("ets_seasons_roads.scs", "ets_seasons_roads2.scs")
+NATURE_PACK = "ets_seasons_nature.scs"
 DATE_PACK = "ets_seasons_date.scs"
 
 
@@ -30,12 +32,29 @@ class Paths:
         return os.path.join(self.out, MAP_PACK)
 
     @property
+    def road_packs(self):
+        return tuple(os.path.join(self.out, name) for name in ROAD_PACKS)
+
+    @property
+    def nature_pack(self):
+        return os.path.join(self.out, NATURE_PACK)
+
+    @property
     def date_pack(self):
         return os.path.join(self.out, DATE_PACK)
 
     @property
+    def map_packs(self):
+        """What a map build writes, lowest priority first."""
+        return (self.map_pack, *self.road_packs, self.nature_pack)
+
+    @property
     def state(self):
         return self.map_pack + ".state.json"
+
+    @property
+    def plan(self):
+        return self.map_pack + ".plan.json"
 
     @property
     def settings(self):

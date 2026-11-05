@@ -14,7 +14,9 @@ from dataclasses import dataclass
 from . import scsc
 
 # Lowest priority first, the same order as in profile.sii.
-SEASON_MODS = (("ets_seasons_map", "Seasons: map data"), ("ets_seasons_date", "Seasons: date"))
+SEASON_MODS = (("ets_seasons_map", "Seasons: map data"), ("ets_seasons_roads", "Seasons: roads"),
+               ("ets_seasons_roads2", "Seasons: roads 2"), ("ets_seasons_nature", "Seasons: nature"),
+               ("ets_seasons_date", "Seasons: date"))
 DEFAULT_PROFILE = "Сезоны"
 BACKUP_SUFFIX = ".seasons_bak"
 
