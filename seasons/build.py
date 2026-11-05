@@ -1,7 +1,12 @@
-"""Builds the two mod packages.
+"""Builds the mod packages.
 
-ets_seasons_map  - rarely rebuilt: patched sectors, material definitions, baked snow textures.
-ets_seasons_date - rebuilt on every launch: date, climates and which snow level each zone shows.
+ets_seasons_map    - patched sectors, definitions of all copies, models of roads and prefabs.
+ets_seasons_roads  - baked textures of roads and sidewalks, overflowing into ets_seasons_roads2.
+ets_seasons_nature - baked textures of terrain and trees, models of trees and far hills.
+ets_seasons_date   - rebuilt on every launch: date, climates and which snow level each zone shows.
+
+The others are rebuilt only when the game's map changes. A pack stays below 4 GB, since
+it isn't known whether the game can read the zip64 format that anything larger would need.
 """
 import json
 import os
@@ -14,10 +19,11 @@ from concurrent.futures import ProcessPoolExecutor
 
 import numpy as np
 
-from . import hashfs, materials as mats, model, roads, sectors as sec, textures as tex, tokens
+from . import hashfs, mapdata as md, materials as mats, model, roads, sectors as sec, textures as tex, tokens, zones as zn
 
 GAME_VERSIONS = "1.61.*"
 BAKE_WIDTH = 512
+PACK_LIMIT = int(3.8 * 2 ** 30)
 CLIMATE_GEOMETRY = """\tmap_projection: lambert_conic
 \tstandard_paralel_1: 37
 \tstandard_paralel_2: 65
@@ -151,47 +157,102 @@ def stock_climate_weights(files):
     return out
 
 
+class Packs:
+    """The archives of a map build. Writing goes to whichever pack the content belongs in."""
+
+    def __init__(self, paths):
+        self.paths = paths
+        self.map = self._open(paths.map_pack, "ets_seasons_map", "Seasons: map data",
+                              "Snow-ready sectors for the base map and DLCs. Needs the other Seasons packs too.")
+        self.road_zips = [self._open(path, f"ets_seasons_roads{i + 1 if i else ''}",
+                                     f"Seasons: roads{f' {i + 1}' if i else ''}",
+                                     "Snow on roads and sidewalks. Needs the other Seasons packs too.")
+                          for i, path in enumerate(paths.road_packs)]
+        self.nature = self._open(paths.nature_pack, "ets_seasons_nature", "Seasons: nature",
+                                 "Snow on terrain, trees and far hills. Needs the other Seasons packs too.")
+
+    @staticmethod
+    def _open(path, name, title, description):
+        zf = zipfile.ZipFile(path, "w", zipfile.ZIP_DEFLATED, compresslevel=1, allowZip64=True)
+        _write_common(zf, name, title, "0.2", "map", description)
+        return zf
+
+    def roads(self):
+        for zf in self.road_zips:
+            if zf.fp.tell() < PACK_LIMIT:
+                return zf
+        raise RuntimeError("baked road textures don't fit in the road packs")
+
+    def close(self):
+        """Finish the archives, refusing any that the game may not be able to read."""
+        too_big = []
+        for zf in (self.map, *self.road_zips, self.nature):
+            if zf.fp.tell() >= 4 * 2 ** 30 - 2 ** 27:
+                too_big.append(zf.filename)
+            zf.close()
+        if too_big:
+            raise RuntimeError(f"packs too large for the game: {too_big}")
+
+
+_WORK = {}
+
+
+def _init_worker(work):
+    """Runs once in each worker process: the plan is too big to send along with every sector."""
+    _WORK.update(work)
+
+
+def _sector_files(archive, name):
+    return {kind: archive.read(f"map/europe/{name}.{kind}") for kind in sec.SECTOR_KINDS}
+
+
+def _survey_sector(job):
+    """Worker: count what stands on one sector, per zone."""
+    path, name, x, z, position = job
+    files = _sector_files(hashfs.Archive(path), name)
+    try:
+        slots = zn.sector_slots(files, x, z, _WORK["vocab"])
+    except md.LayoutError as err:
+        raise md.LayoutError(f"{name}: {err}") from err
+    low, frac = zn.split_position(position, model.ZONE_COUNT)
+    return zn.survey(files, slots, low, frac, _WORK["vocab"], _WORK["zones"])
+
+
 def _patch_sector(job):
     """Worker: patch one sector's files. Runs in a separate process."""
-    path, name, x, z, position, known, zones, indices, road_index, prefab_index = job
-    archive = hashfs.Archive(path)
+    path, name, x, z, position = job
+    known, zones, indices = _WORK["known"], _WORK["zones"], _WORK["indices"]
+    files = _sector_files(hashfs.Archive(path), name)
     token_set = sec.MaterialSet(known)
-    low = min(int(position), model.ZONE_COUNT - 2)
-    frac = position - low
-    index_of = dict(indices)
+    low, frac = zn.split_position(position, model.ZONE_COUNT)
 
     def variant_of(tok, zone):
-        idx = index_of.get(tok)
+        idx = indices.get(tok)
         if idx is None or zone not in zones:
             return None
         return tokens.encode(mats.variant_name(zone, idx))
 
-    out = {}
-    swapped = road_total = prefab_total = 0
-    for kind in sec.SECTOR_KINDS:
-        data = archive.read(f"map/europe/{name}.{kind}")
-        if not data:
-            continue
-        tables = sec.find_tables(data, token_set)
-        patched, n = sec.patch_tables(data, tables, low, frac, variant_of)
-        if kind == "base" and road_index:
-            wanted = {struct.pack("<Q", value): value for value in road_index}
-            refs = roads.find_refs(data, sec.Sector(x, z, name, None), wanted)
-            patched, road_swaps = roads.patch_refs(patched, refs, low, frac, road_index, zones)
-            n += road_swaps
-            road_total += road_swaps
-        if kind == "base" and prefab_index:
-            refs = roads.find_prefab_refs(data, sec.Sector(x, z, name, None), set(prefab_index))
-            patched, prefab_swaps = roads.patch_prefab_refs(data, patched, refs, low, frac, prefab_index, zones)
-            n += prefab_swaps
-            prefab_total += prefab_swaps
-        if n:
-            out[kind] = patched
+    patched = {}
+    swapped = 0
+    for kind, data in files.items():
+        if data:
+            out, n = sec.patch_tables(data, sec.find_tables(data, token_set), low, frac, variant_of)
+            patched[kind] = bytearray(out)
             swapped += n
-    return name, out, swapped, road_total, prefab_total
+    swaps = zn.apply_plan(files, patched, zn.sector_slots(files, x, z, _WORK["vocab"]), low, frac, _WORK["plan"])
+    return name, {kind: bytes(data) for kind, data in patched.items() if data != files[kind]}, swapped, swaps
 
 
-def build_map_pack(game_dir, out_path, top=800, textures_dir=None, workers=None, log=print):
+def _center_plan(zones, indices):
+    """The material between the two carriageways of a road is an ordinary terrain material."""
+    return {(zone, tok): tokens.encode(mats.variant_name(zone, idx)) for zone in zones for tok, idx in indices.items()}
+
+
+def _plan_for_json(plan):
+    return {kind: [[zone, token, new] for (zone, token), new in table.items()] for kind, table in plan.items()}
+
+
+def build_map_pack(game_dir, paths, top=None, textures_dir=None, workers=None, log=print):
     started = time.time()
     files = hashfs.GameFiles(game_dir)
     sector_list = sec.list_sectors(files)
@@ -213,20 +274,35 @@ def build_map_pack(game_dir, out_path, top=800, textures_dir=None, workers=None,
     covered = sum(tally.get(mats.token_value(m.name), 0) for m in chosen)
     log(f"materials chosen: {len(chosen)}, {100 * covered / total:.0f}% of terrain tables")
 
-    with zipfile.ZipFile(out_path, "w", zipfile.ZIP_DEFLATED, compresslevel=1, allowZip64=True) as zf:
-        _write_common(zf, "ets_seasons_map", "Seasons: map data", "0.1", "map",
-                      "Snow-ready terrain for the base map and DLCs. Needs 'Seasons: date' too.")
-        keys = bake_all(chosen, zf, textures_dir, log)
-        final = [m for m in chosen if m.base_texture in keys]
-        indices = [(mats.token_value(m.name), i) for i, m in enumerate(final)]
+    vocab, defs = roads.load_vocabulary(files)
+    vocab.center = set(known)
+    snowy = set(zones)
+    jobs = [(s.archive.path, s.name, s.x, s.z, positions[s.name]) for s in sector_list
+            if {zn.split_position(positions[s.name], model.ZONE_COUNT)[0],
+                zn.split_position(positions[s.name], model.ZONE_COUNT)[0] + 1} & snowy]
+    tally = Counter()
+    with ProcessPoolExecutor(max_workers=workers, initializer=_init_worker,
+                             initargs=({"vocab": vocab, "zones": snowy},)) as pool:
+        for counted in pool.map(_survey_sector, jobs, chunksize=4):
+            tally.update(counted)
+    kinds = Counter()
+    for (kind, _zone, _token, _owner), count in tally.items():
+        kinds[kind] += count
+    log(f"items on the snowy map: {dict(kinds)}")
 
-        defs = ["SiiNunit\n{\n"]
+    packs = Packs(paths)
+    try:
+        keys = bake_all(chosen, packs.nature, textures_dir, log)
+        final = [m for m in chosen if m.base_texture in keys]
+        indices = {mats.token_value(m.name): i for i, m in enumerate(final)}
+
+        material_defs = ["SiiNunit\n{\n"]
         for zone in zones:
             for i, m in enumerate(final):
-                defs.append(f"material_def : terrain_mat.{mats.variant_name(zone, i)}\n{{\n"
-                            f'\tpath: "/material/seasons/z{zone}/{i}.mat"\n{m.extra}}}\n')
-        defs.append("}\n")
-        zf.writestr("def/world/terrain_material.ets_seasons.sii", "".join(defs))
+                material_defs.append(f"material_def : terrain_mat.{mats.variant_name(zone, i)}\n{{\n"
+                                     f'\tpath: "/material/seasons/z{zone}/{i}.mat"\n{m.extra}}}\n')
+        material_defs.append("}\n")
+        packs.map.writestr("def/world/terrain_material.ets_seasons.sii", "".join(material_defs))
 
         veg = mats.detail_vegetation(files)
         lines = ["SiiNunit\n{\n"]
@@ -241,53 +317,57 @@ def build_map_pack(game_dir, out_path, top=800, textures_dir=None, workers=None,
                 lines.extend(f"\t{ln}\n" for ln in models)
                 lines.append("}\n")
         lines.append("}\n")
-        zf.writestr("def/world/detail_vegetation_def.ets_seasons.sii", "".join(lines))
+        packs.map.writestr("def/world/detail_vegetation_def.ets_seasons.sii", "".join(lines))
 
-        road_index, prefab_index, road_records = {}, {}, []
+        plan, records = {}, []
         if textures_dir:
-            road_index, prefab_index, road_records = roads.build_into(zf, files, sector_list, positions, zones,
-                                                                      textures_dir, read_extracted, log)
+            plan, records = roads.build_into(packs, files, vocab, defs, tally, textures_dir, read_extracted, log)
+        plan = dict(plan)
+        plan["center"] = _center_plan(zones, indices)
+        for kind in vars(vocab):
+            plan.setdefault(kind, {})
 
-        jobs = []
         for s in sector_list:
             desc = s.archive.read(f"map/europe/{s.name}.desc")
             cls = CLIMATE_CLASSES.get(sec.desc_climate(desc), "d")
             nearest = int(round(positions[s.name]))
-            zf.writestr(f"map/europe/{s.name}.desc",
-                        sec.patch_desc(desc, tokens.encode(climate_token(cls, nearest))))
-            low = min(int(positions[s.name]), model.ZONE_COUNT - 2)
-            if low in zones or low + 1 in zones:
-                jobs.append((s.archive.path, s.name, s.x, s.z, positions[s.name], known, set(zones), indices,
-                             road_index, prefab_index))
+            packs.map.writestr(f"map/europe/{s.name}.desc",
+                               sec.patch_desc(desc, tokens.encode(climate_token(cls, nearest))))
 
-        swapped = road_swaps = prefab_swaps = done = 0
-        with ProcessPoolExecutor(max_workers=workers) as pool:
-            for name, out, n, roads_here, prefabs_here in pool.map(_patch_sector, jobs, chunksize=4):
+        swapped = done = 0
+        swaps = Counter()
+        with ProcessPoolExecutor(max_workers=workers, initializer=_init_worker,
+                                 initargs=({"known": known, "zones": snowy, "indices": indices, "plan": plan,
+                                            "vocab": vocab},)) as pool:
+            for name, out, n, here in pool.map(_patch_sector, jobs, chunksize=4):
                 for kind, data in out.items():
-                    zf.writestr(f"map/europe/{name}.{kind}", data)
+                    packs.map.writestr(f"map/europe/{name}.{kind}", data)
                 swapped += n
-                road_swaps += roads_here
-                prefab_swaps += prefabs_here
+                swaps.update(here)
                 done += 1
                 if done % 100 == 0:
                     log(f"  sectors patched: {done}/{len(jobs)}")
-        log(f"sectors patched: {done}, references swapped: {swapped}, "
-            f"of them road pieces: {road_swaps}, prefabs: {prefab_swaps}")
+        log(f"sectors patched: {done}, terrain table tokens: {swapped}")
+        for kind, total in sorted(kinds.items()):
+            log(f"  {kind}: {swaps.get(kind, 0)} of {total} on the snowy map have snow")
+    finally:
+        packs.close()
 
     state = {
         **_field_entries(sector_list, located, positions),
         "game_stamp": game_stamp(game_dir),
-        "road_materials": road_records,
-        "road_tokens": sorted(road_index),
-        "prefab_tokens": sorted(prefab_index),
+        "road_materials": records,
         "zones": zones,
         "climate_weights": stock_climate_weights(files),
         "materials": [{"name": m.name, "path": m.path, "base_texture": m.base_texture,
                        "text": m.text, "key": keys[m.base_texture]} for m in final],
     }
-    with open(out_path + ".state.json", "w", encoding="utf8") as fh:
+    with open(paths.plan, "w", encoding="utf8") as fh:
+        json.dump(_plan_for_json(plan), fh)
+    with open(paths.state, "w", encoding="utf8") as fh:
         json.dump(state, fh)
-    log(f"map pack: {os.path.getsize(out_path) / 2 ** 30:.2f} GB in {time.time() - started:.0f}s")
+    sizes = ", ".join(f"{os.path.basename(p)} {os.path.getsize(p) / 2 ** 30:.2f} GB" for p in paths.map_packs)
+    log(f"{sizes}, built in {time.time() - started:.0f}s")
     return state
 
 

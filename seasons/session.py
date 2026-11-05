@@ -32,7 +32,7 @@ def game_running():
 
 def load_state(paths):
     """The map pack's state, or None when it hasn't been built."""
-    if not (os.path.exists(paths.state) and os.path.exists(paths.map_pack)):
+    if not (os.path.exists(paths.state) and all(os.path.exists(pack) for pack in paths.map_packs)):
         return None
     with open(paths.state, encoding="utf8") as fh:
         return json.load(fh)
@@ -56,15 +56,39 @@ def game_updated(paths, state):
 
 
 def _install(source, target):
-    """Copy a pack into the mod folder unless it's already there."""
-    if os.path.exists(target):
-        a, b = os.stat(source), os.stat(target)
-        if a.st_size == b.st_size and int(a.st_mtime) == int(b.st_mtime):
-            return False
+    """Make the mod folder hold a pack, without copying it when the system allows a link.
+
+    A link costs no space on the game's drive and always shows the current pack. Windows allows
+    links only with Developer Mode on or with administrator rights; without them the pack is copied.
+    A copy left half-written by an interrupted run is removed first.
+    """
     tmp = target + ".tmp"
-    shutil.copy2(source, tmp)
+    if os.path.lexists(tmp):
+        os.remove(tmp)
+    if os.path.islink(target) and os.path.realpath(target) == os.path.realpath(source):
+        return False
+    try:
+        os.symlink(os.path.abspath(source), tmp)
+    except OSError:
+        if os.path.exists(target):
+            a, b = os.stat(source), os.stat(target)
+            if a.st_size == b.st_size and int(a.st_mtime) == int(b.st_mtime):
+                return False
+        shutil.copy2(source, tmp)
     os.replace(tmp, target)
     return True
+
+
+def drop_navigation_cache(paths, profile_name):
+    """Set aside the game's navigation cache of a profile, which the game would otherwise keep using.
+
+    The cache is built from the map on first use and is never checked again. Once the map has
+    changed, the game reads node indices that no longer exist and crashes. It rebuilds the cache
+    on its next start; the old one is kept as a .stale file.
+    """
+    path = os.path.join(paths.docs, "cache", profiles.folder_name(profile_name) + ".navcache")
+    if os.path.exists(path):
+        os.replace(path, path + ".stale")
 
 
 def prepare(paths, state, date, profile_name, log=lambda _text: None):
@@ -77,8 +101,10 @@ def prepare(paths, state, date, profile_name, log=lambda _text: None):
     build.build_date_pack(state, date, paths.date_pack)
     os.makedirs(paths.mods, exist_ok=True)
     log("Копирую моды в папку игры")
-    _install(paths.map_pack, os.path.join(paths.mods, os.path.basename(paths.map_pack)))
+    map_changed = any([_install(pack, os.path.join(paths.mods, os.path.basename(pack))) for pack in paths.map_packs])
     _install(paths.date_pack, os.path.join(paths.mods, os.path.basename(paths.date_pack)))
+    if map_changed:
+        drop_navigation_cache(paths, profile_name)
     log("Расставляю моды в профиле")
     profile = profiles.find_or_create(paths.profiles, profile_name)
     profiles.apply_order(profile)

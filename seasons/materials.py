@@ -9,7 +9,7 @@ _DEF_RE = re.compile(r"material_def\s*:\s*terrain_mat\.(\w+)\s*\{(.*?)\}", re.S)
 _DETAIL_RE = re.compile(r"detail_vegetation_def\s*:\s*\S+\s*\{(.*?)\}", re.S)
 _TEXTURE_RE = re.compile(r'texture\s*:\s*"(\w+)"\s*\{(.*?)\}', re.S)
 _SOURCE_RE = re.compile(r'source\s*:\s*"([^"]+)"')
-_EXCLUDED = re.compile(r"water|stamp|lava|inv|underground|hell|halloween", re.I)
+_EXCLUDED = re.compile(r"water|none_umat|stamp|underground|halloween", re.I)
 _LINEAR_SNOW = (0.58, 0.61, 0.65)
 _SRGB_SNOW = (200, 205, 211)
 

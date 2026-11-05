@@ -1,8 +1,8 @@
-"""Snow on road surfaces: per-zone copies of road looks, prefabs, their models and their materials.
+"""Snow on what stands on the map: per-zone copies of roads, prefabs, trees and their materials.
 
-A road look or a prefab points to a model, and the model lists its materials by path. So a zone
-gets its own look or prefab, its own copy of the model with those paths changed, and its own
-materials. Prefab geometry is too big to repeat for every zone, so its copies share one archive
+A road look, a road edge, a prefab, a corner or a tree points to a model, and the model lists its
+materials by path. So a zone gets its own unit, its own copy of the model with those paths changed,
+and its own materials. Geometry is too big to repeat for every zone, so copies share one archive
 entry under several names.
 """
 import copy
@@ -16,13 +16,13 @@ from dataclasses import dataclass, field
 
 import numpy as np
 
-from . import materials as mats, model, sectors as sec, textures as tex, tokens
+from . import materials as mats, pmx, textures as tex, tokens, zones as zn
 
 _SII_TOKEN_RE = re.compile(r'"(?:[^"\\\n]|\\.)*"|#[^\n]*|//[^\n]*|/\*.*?\*/|[{}]', re.S)
 _HEADER_RE = re.compile(r"(\w+)\s*:\s*([\w.]+)\s*$")
 _REFERENCE_RE = re.compile(r"(:\s*)(\.[\w.]+)")
 _MODEL_RE = re.compile(r'"(/road_template/[^"]+\.pmd)"')
-_PREFAB_MODEL_RE = re.compile(r'"(/[^"]+\.pmd)"')
+_ANY_MODEL_RE = re.compile(r'"(/[^"]+\.pmd)"')
 _PREFAB_LINK_RE = re.compile(r"(:\s*prefab\.)(\w+)")
 _NAMED_PREFAB_RE = re.compile(rb"(?:\bprefab\.|\bprefab_name:\s*)(\w+)")
 _MATERIAL_RE = re.compile(rb"/automat/[0-9a-f]{2}/[0-9a-f]{16}\.mat")
@@ -30,23 +30,55 @@ _EFFECT_RE = re.compile(r'effect\s*:\s*"([^"]+)"')
 _SUBSTANCE_RE = re.compile(r'substance\s*:\s*"([^"]*)"')
 _TEXTURE_RE = re.compile(r'texture\s*:\s*"(\w+)"\s*\{(.*?)\}', re.S)
 _SOURCE_RE = re.compile(r'source\s*:\s*"([^"]+)"')
-_SNOWY_SLOTS = ("texture_base", "texture_over")
+_SLOT_BLOCK_RE = re.compile(r'(texture\s*:\s*"(\w+)"\s*\{[^}]*?source\s*:\s*")([^"]+)(")', re.S)
+_PAINTED_SLOT_RE = re.compile(r"texture_(base|over)(_\d+)?")
+_MULT_SLOT_RE = re.compile(r"texture_mult(_\d+)?")
 _ZONE_CHARS = "0123456789abcdefghijklmnopqrstuvwxyz"
 _ROAD_SUBSTANCES = {"road", "road_dirt", "road_coarse", "dirt", "gravel"}
 _GROUND_SUBSTANCES = {"grass"}
 # Some surfaces name no substance, so their textures have to tell.
-_ROAD_SOURCE_RE = re.compile(r"/material/road/|/material/(terrain|tiled)/([\w/]*/)?(sidewalk|cobble|paving|asphalt)")
-_GROUND_SOURCE_RE = re.compile(r"/material/terrain/")
+_ROAD_SOURCE_RE = re.compile(r"/material/road/|/material/tiled/|/material/(terrain|ground)/([\w/]*/)?"
+                             r"(sidewalk|cobble|paving|asphalt)")
+_GROUND_SOURCE_RE = re.compile(r"/material/terrain/|/material/ground/")
+# Laid in small pieces rather than along the road, so snow on them has no direction.
+_TILED_SOURCE_RE = re.compile(r"/tiled/|sidewalk|pavement|cobble|paving|curb|kerb")
+_NATURE_SOURCE_RE = re.compile(r"/vegetation/|/asset/(stone|rock|hill)/|/model2?/(rock|hill)/")
+# A surface wide enough to hold lanes. Anything else a road substance is on is a yard or a parking lot.
+_LANE_SOURCE_RE = re.compile(r"road_template|/material/road/")
+_NATURE_MODEL_RE = re.compile(r"/vegetation/|/rock/|/hill|/mountain|/stone|/cliff|/tree|/forest")
+# These have lights or glass in them, or draw nothing to put snow on.
+_UNTOUCHED_EFFECT_RE = re.compile(r"none|shadowonly|retroreflective|lamp|lightmap|baked|glass|water|\.lum\b")
+_SEE_THROUGH_EFFECT_RE = re.compile(r"leaves|\.a\.|asafew|billboard|decal")
 # Wear and dirt drawn over a road. Everything else that is transparent is markings, which stay.
 _FADING_RE = re.compile(r"/(road_cracks|road_decal|decal_|overlay_|rumble_stripe)|_decal\b")
+_LANE_RE = re.compile(r"lanes_(left|right)\[\d*\]\s*:")
+_TEMPLATE_RE = re.compile(r'template_(left|right)\s*:\s*"(/[^"]+\.pmd)"')
+_COMPATIBLE_EDGE_RE = re.compile(r"(compatible_edges_\w+\[\d*\]\s*:\s*)(\w+)")
+_CORNER_RE = re.compile(r"(corner\d\[\d*\]\s*:\s*)(\w+)")
+_VEGETATION_MODEL_RE = re.compile(r"(model\[\d*\]\s*:\s*)(vegetmodel\.[\w.]+)")
+_MATERIAL_PATH_RE = re.compile(r'((?:path|kerb)\s*:\s*")([^"]+)(")')
+_SIMPLE_TOKEN_RE = re.compile(r"[0-9a-z_]{1,12}")
 
-PREFAB_ITEM = 4
-PREFAB_MODEL_AT = 57  # from the start of a prefab item to its model token
-
-BAKE_WIDTH = 2048  # one repeat spans the width of a road, about 14 m, so this is 7 mm per texel
+ROAD_WIDTH = 2048   # a road's texture spans about 14 m across, so this is 7 mm per texel
+DETAIL_WIDTH = 1024
 # A road always keeps some bare tracks, so its top level isn't fully white.
 LEVEL_COVER = {1: 0.25, 2: 0.5, 3: 0.75, 4: 0.92}
+# Nobody drives on a sidewalk, so snow settles there sooner and stays whole.
+TILED_COVER = {1: 0.4, 2: 0.7, 3: 0.92, 4: 1.0}
+# Trees shake light snow off, and a light dusting of a whole forest would read as dust.
+TREE_COVER = {2: 0.25, 3: 0.45, 4: 0.65}
 PACKED_SNOW_TINT = 0.92
+
+WHEEL_OFFSET_M = 1.05   # from the middle of a lane
+SHOULDER_IN_MODEL_M = 0.25
+MIN_LANE_M, MAX_LANE_M = 2.4, 7.0
+MIN_SURFACE_WIDTH_M = 2.5
+MIN_SURFACE_U = 0.05
+RUT_MERGE_M = 0.25
+RUT_MIN_SHARE = 0.05
+
+# Old roads have no model: this is where the game's look definitions put a lane on the texture.
+LEGACY_RUTS = {"us": [0.5 + 0.252 * 1.2 / 4.5, 0.5 + 0.252 * 3.3 / 4.5], "per_metre": 0.252 / 4.5}
 
 
 @dataclass
@@ -105,7 +137,7 @@ def load_looks(files):
         for kind, name, body in parse_units(raw.decode("utf8", "replace")):
             if kind == "road_look" and name.startswith("road."):
                 short = name.split(".", 1)[1]
-                if short not in looks and re.fullmatch(r"[0-9a-z_]{1,12}", short):
+                if short not in looks and _SIMPLE_TOKEN_RE.fullmatch(short):
                     looks[short] = Look(short, kind, body)
             else:
                 units.setdefault(name, (kind, name, body))
@@ -119,7 +151,21 @@ def load_looks(files):
             seen.add(name)
             look.related.append(units[name])
             waiting += references(units[name][2])
-    return {k: v for k, v in looks.items() if v.models}
+    return looks
+
+
+def load_units(files, prefix, kind, tokens_only=True):
+    """Units of one kind that can be copied as they are: {short name: (full name, body)}.
+
+    The name of a unit a sector refers to has to fit a token, unlike one only other units refer to.
+    """
+    out = {}
+    for _fname, raw in files.read_all("def/world", prefix):
+        for unit_kind, name, body in parse_units(raw.decode("utf8", "replace")):
+            short = name.split(".", 1)[1] if "." in name else name
+            if unit_kind == kind and not references(body) and (not tokens_only or _SIMPLE_TOKEN_RE.fullmatch(short)):
+                out.setdefault(short, (name, body))
+    return out
 
 
 def variant_name(zone, index):
@@ -133,20 +179,22 @@ def zone_material_path(path, zone):
     return "/".join(parts)
 
 
-def zone_model_path(zone, index):
-    return f"/road_template/z{zone}/m{index}.pmd"
+def legacy_material_path(index, zone):
+    return f"/material/seasons/legacy/z{zone}/{index}.mat"
 
 
-def rename_look(look, new_name, models):
-    """A full copy of the look under a new name, pointing to the given models.
+def rename_look(look, new_name, models, edges=None):
+    """A full copy of the look under a new name, pointing to the given models and edges.
 
     The game lets only one owner refer to an anonymous unit, so the copy can't share them with the
     original: each one it refers to is copied as well, under a name that can't collide.
     """
     renamed = {name: f".rv.{new_name}.{i}" for i, (_kind, name, _body) in enumerate(look.related)}
+    edges = edges or {}
 
     def retarget(body):
-        body = _MODEL_RE.sub(lambda m: f'"{models.get(m.group(1), m.group(1))}"', body)
+        body = _ANY_MODEL_RE.sub(lambda m: f'"{models.get(m.group(1), m.group(1))}"', body)
+        body = _COMPATIBLE_EDGE_RE.sub(lambda m: m.group(1) + edges.get(m.group(2), m.group(2)), body)
         return _REFERENCE_RE.sub(lambda m: m.group(1) + renamed.get(m.group(2), m.group(2)), body)
 
     out = [f"{look.kind} : road.{new_name}\n{{{retarget(look.body)}}}\n"]
@@ -165,59 +213,32 @@ def patch_model(pmd, replacements):
     return out
 
 
-def find_refs(data, sector, wanted):
-    """Offsets of road look tokens in a sector's .base file.
-
-    A road item stores its bounding box right before the look. What follows the look varies from
-    road to road, so only the box can tell: it has to lie in this very sector, which numbers that
-    merely look like a token won't manage.
-    """
-    size = 4000.0
-    x0, x1 = (sector.x - 1) * size, (sector.x + 2) * size
-    z0, z1 = (sector.z - 1) * size, (sector.z + 2) * size
-    refs = []
-    for raw, value in wanted.items():
-        p = data.find(raw)
-        while p >= 0:
-            if p >= 49:
-                min_x, _y, min_z = struct.unpack_from("<3f", data, p - 49)
-                max_x, _y2, max_z = struct.unpack_from("<3f", data, p - 29)
-                if x0 <= min_x <= max_x <= x1 and z0 <= min_z <= max_z <= z1:
-                    refs.append((p, value))
-            p = data.find(raw, p + 1)
-    return sorted(refs)
-
-
-def patch_refs(data, refs, zone_low, frac, index_of, zones):
-    """Swap road looks for their zone copies; returns (data, swaps).
-
-    Road pieces split between two neighbouring zones the same way terrain tables do.
-    """
-    out = bytearray(data)
-    swapped = 0
-    for p, value in refs:
-        take_upper = sec.content_choice(data, p - 49, 57, frac)
-        zone = zone_low + 1 if take_upper else zone_low
-        index = index_of.get(value)
-        if index is None or zone not in zones:
-            continue
-        struct.pack_into("<Q", out, p, tokens.encode(variant_name(zone, index)))
-        swapped += 1
-    return bytes(out), swapped
-
-
 def snow_mode(effect, substance, base_source):
-    """How snow treats a material: "road", "ground", "fade", or None when it stays as it is."""
+    """How snow treats a material: "road", "tiled", "ground", "fade", "tree", or None when it stays as it is."""
+    if _UNTOUCHED_EFFECT_RE.search(effect):
+        return None
+    see_through = _SEE_THROUGH_EFFECT_RE.search(effect) or "difopa" in base_source
+    if _NATURE_SOURCE_RE.search(base_source):
+        return "tree" if see_through else "ground"
     if "decal" in effect or ".a." in effect:  # the alpha channel is opacity here, so it can't be painted over
         return "fade" if substance in _ROAD_SUBSTANCES or _FADING_RE.search(base_source) else None
     if substance in _GROUND_SUBSTANCES:
         return "ground"
     if substance in _ROAD_SUBSTANCES or _ROAD_SOURCE_RE.search(base_source):
-        return "road"
+        lanes = _LANE_SOURCE_RE.search(base_source) and not _TILED_SOURCE_RE.search(base_source)
+        return "road" if lanes else "tiled"
     return "ground" if _GROUND_SOURCE_RE.search(base_source) else None
 
 
-def _material_info(files, path, textures_dir):
+def covers_for(mode):
+    return {"tiled": TILED_COVER, "tree": TREE_COVER}.get(mode, LEVEL_COVER)
+
+
+def _dds_path(textures_dir, source):
+    return os.path.join(textures_dir, source.lstrip("/").rsplit(".", 1)[0] + ".dds")
+
+
+def _material_info(files, path, textures_dir, missing=None):
     """The material's text and the textures to bake, or None if snow doesn't touch it."""
     raw = files.read(path)
     if raw is None:
@@ -225,106 +246,229 @@ def _material_info(files, path, textures_dir):
     text = mats.absolute_sources(raw.decode("utf8", "replace"), path)
     effect = _EFFECT_RE.search(text)
     substance = _SUBSTANCE_RE.search(text)
-    if not effect or "none" in effect.group(1):
+    if not effect:
         return None
     slots = {}
     for slot, body in _TEXTURE_RE.findall(text):
         src = _SOURCE_RE.search(body)
-        if slot in _SNOWY_SLOTS and src:
-            dds = os.path.join(textures_dir, src.group(1).lstrip("/").rsplit(".", 1)[0] + ".dds")
-            if not os.path.exists(dds):
-                return None
+        if src and (_PAINTED_SLOT_RE.fullmatch(slot) or _MULT_SLOT_RE.fullmatch(slot)):
             slots[slot] = src.group(1)
     if "texture_base" not in slots:
         return None
     mode = snow_mode(effect.group(1), substance.group(1) if substance else "", slots["texture_base"])
-    return {"path": path, "text": text, "slots": slots, "mode": mode} if mode else None
+    if not mode:
+        return None
+    if mode not in ("road", "tiled"):
+        slots = {slot: src for slot, src in slots.items() if not _MULT_SLOT_RE.fullmatch(slot)}
+    absent = [src for src in slots.values() if not os.path.exists(_dds_path(textures_dir, src))]
+    if absent:
+        if missing is not None:
+            missing.update(absent)
+        return None
+    return {"path": path, "text": text, "slots": slots, "mode": mode}
 
 
 def baked_path(key, level):
     return f"/material/seasons/road/{key}_{level}.tobj"
 
 
+def slot_mode(info, slot):
+    """How one texture of a material is baked."""
+    return "mult" if _MULT_SLOT_RE.fullmatch(slot) else info["mode"]
+
+
 def _bake_job(job):
     """Worker: every snow level of one texture. Runs in a separate process."""
-    textures_dir, read_image, path, mode, noise_from, key, snow_rgb = job
-    base = read_image(textures_dir, path, BAKE_WIDTH)
+    textures_dir, read_image, path, mode, key, snow_rgb, ruts, per_metre = job
+    if mode == "tree":
+        with open(_dds_path(textures_dir, path), "rb") as fh:
+            chain = tex.read_dds_chain(fh.read(), DETAIL_WIDTH)
+        if chain is None:
+            return path, mode, key, None
+        return path, mode, key, {level: tex.write_dds(chain[0], tex.bake_cut_out(chain, cover))
+                                 for level, cover in TREE_COVER.items()}
+    base = read_image(textures_dir, path, ROAD_WIDTH if mode == "road" else DETAIL_WIDTH)
     if base is None:
-        return path, key, None
+        return path, mode, key, None
     h, w = base.shape[:2]
+    covers = covers_for(mode)
     if mode == "road":
-        source = base if noise_from == path else read_image(textures_dir, noise_from, BAKE_WIDTH)
-        noise = tex.resampled(tex.road_noise(base if source is None else source), h, w)
+        noise = tex.road_noise(base, ruts=ruts, per_metre=per_metre)
+        rut = tex.rut_field(h, w, ruts, per_metre) if ruts else None
         snow = tex.packed_snow(h, w, snow_rgb)
+        paint = lambda cover: tex.bake_road(base, snow, noise, cover, rut)
+    elif mode == "tiled":
+        noise = tex.resampled(tex.periodic_noise(256, seed=29), h, w)
+        snow = tex.packed_snow(h, w, tuple(v / PACKED_SNOW_TINT for v in snow_rgb))
         paint = lambda cover: tex.bake_road(base, snow, noise, cover)
     elif mode == "ground":
         tile = read_image(textures_dir, "/material/terrain/snow.tobj", 256)
         tile = tex.flat_snow(256) if tile is None else tile
         noise = tex.periodic_noise(256, seed=19)
         paint = lambda cover: tex.bake(base, tile, noise, cover)
+    elif mode == "mult":
+        paint = lambda cover: tex.neutral_mult(base, cover)
     else:
         paint = lambda cover: tex.fade_decal(base, cover)
-    return path, key, {level: tex.write_dds(paint(cover)) for level, cover in LEVEL_COVER.items()}
+    return path, mode, key, {level: tex.write_dds(paint(cover)) for level, cover in covers.items()}
 
 
 def bake_jobs(found):
-    """One entry per distinct texture: (path, mode, texture its snow pattern follows).
-
-    The layers of a two layer road share their UV, so the pattern comes from the base layer of
-    both, or snow wouldn't line up where one layer blends into the other.
-    """
-    jobs = {}
+    """One entry per distinct way to bake a texture: (path, mode)."""
+    jobs = set()
     for info in found:
         for slot, path in info["slots"].items():
-            jobs.setdefault(path, (path, info["mode"], info["slots"]["texture_base"]))
-    return list(jobs.values())
+            jobs.add((path, slot_mode(info, slot)))
+    return sorted(jobs)
 
 
-def _bake_textures(found, zf, textures_dir, read_image, log):
-    """Bake every distinct road texture. Returns {tobj path: key}."""
+def merge_ruts(positions, per_metre):
+    """Join wheel track positions closer than a tyre, dropping those hardly ever driven on."""
+    reach = RUT_MERGE_M * per_metre
+    groups = []
+    for u, weight in sorted(positions.items()):
+        if groups and u - groups[-1][-1][0] <= reach:
+            groups[-1].append((u, weight))
+        else:
+            groups.append([(u, weight)])
+    merged = [(sum(u * w for u, w in g) / sum(w for _u, w in g), sum(w for _u, w in g)) for g in groups]
+    if not merged:
+        return []
+    top = max(w for _u, w in merged)
+    return [round(u, 4) for u, w in merged if w >= RUT_MIN_SHARE * top]
+
+
+def lane_tracks(left, right, lanes):
+    """X positions of the wheel tracks of `lanes` equal lanes between two edges of a road."""
+    if lanes < 1:
+        return []
+    width = (right - left - 2 * SHOULDER_IN_MODEL_M) / lanes
+    if not MIN_LANE_M <= width <= MAX_LANE_M:
+        return []
+    start = left + SHOULDER_IN_MODEL_M
+    out = []
+    for lane in range(lanes):
+        middle = start + (lane + 0.5) * width
+        out += [middle - WHEEL_OFFSET_M, middle + WHEEL_OFFSET_M]
+    return out
+
+
+def _piece_columns(piece, channel):
+    """Across the road: distinct X positions with their mean U, for interpolating along a surface."""
+    columns = defaultdict(list)
+    for x, u in zip(piece.positions[:, 0].tolist(), piece.uvs[channel][:, 0].tolist()):
+        columns[round(x, 2)].append(u)
+    xs = sorted(columns)
+    return np.array(xs), np.array([sum(columns[x]) / len(columns[x]) for x in xs])
+
+
+def _tally_tracks(tally, scales, materials, pieces, tracks, weight):
+    """Add where these wheel tracks fall on each texture, going through each surface's UV."""
+    for piece in pieces:
+        info = materials[piece.slot]
+        for slot, path in info["slots"].items():
+            if slot_mode(info, slot) != "road":
+                continue
+            channel = min(0 if slot == "texture_base" else 1, len(piece.uvs) - 1)
+            u = piece.uvs[channel][:, 0]
+            if u.max() - u.min() < MIN_SURFACE_U:
+                continue
+            xs, us = _piece_columns(piece, channel)
+            if xs.size < 2:
+                continue
+            per_metre = float(np.median(np.abs(np.diff(us) / np.maximum(np.diff(xs), 1e-3))))
+            if per_metre <= 0:
+                continue
+            for track in tracks:
+                if xs[0] <= track <= xs[-1]:
+                    tally[path][round(float(np.interp(track, xs, us)) % 1.0, 3)] += weight
+                    scales[path][round(per_metre, 3)] += weight
+
+
+def road_ruts(looks, counts, read_model, material_of):
+    """Where the wheels run on each road texture: {texture: {"us": [...], "per_metre": ...}}.
+
+    A road texture holds several lanes side by side and each model maps its own part of it, so
+    this goes through the geometry of every look in use, weighted by how often the look occurs.
+    `read_model` gives a model's (material table, pieces) and `material_of` a material's info.
+    """
+    tally = defaultdict(Counter)
+    scales = defaultdict(Counter)
+    for look in looks:
+        templates = dict(_TEMPLATE_RE.findall(look.body))
+        lanes = Counter(_LANE_RE.findall(look.body))
+        for side, path in templates.items():
+            model = read_model(path)
+            if model is None:
+                continue
+            tables, pieces = model
+            count = lanes[side] if len(templates) == 2 else lanes["left"] + lanes["right"]
+            for table in tables:  # a look of the model, often one per country
+                materials = {i: material_of(name) for i, name in enumerate(table)}
+                surfaces = [p for p in pieces if p.slot in materials and materials[p.slot]
+                            and materials[p.slot]["mode"] == "road"
+                            and p.positions[:, 0].max() - p.positions[:, 0].min() >= MIN_SURFACE_WIDTH_M]
+                if not surfaces:
+                    continue
+                left = min(float(p.positions[:, 0].min()) for p in surfaces)
+                right = max(float(p.positions[:, 0].max()) for p in surfaces)
+                tracks = lane_tracks(left, right, count)
+                _tally_tracks(tally, scales, materials, surfaces, tracks, counts.get(look.name, 1))
+    out = {}
+    for path, positions in tally.items():
+        per_metre = scales[path].most_common(1)[0][0]
+        us = merge_ruts(positions, per_metre)
+        if us:
+            out[path] = {"us": us, "per_metre": per_metre}
+    return out
+
+
+def _bake_textures(found, packs, textures_dir, read_image, ruts, log):
+    """Bake every distinct texture. Returns {(tobj path, mode): key}."""
     stock = read_image(textures_dir, "/material/terrain/snow.tobj", 256)
     rgb = tex.SNOW_RGB if stock is None else stock[:, :, :3].mean(axis=(0, 1))
     snow_rgb = tuple(float(v) * PACKED_SNOW_TINT for v in rgb)
     jobs = bake_jobs(found)
-    work = [(textures_dir, read_image, path, mode, noise_from, f"r{i}", snow_rgb)
-            for i, (path, mode, noise_from) in enumerate(jobs)]
+    # A second layer of a road blends into the first, so without a place of its own it follows that one.
+    for info in found:
+        if info["mode"] == "road" and info["slots"].get("texture_base") in ruts:
+            for slot, path in info["slots"].items():
+                if slot_mode(info, slot) == "road":
+                    ruts.setdefault(path, ruts[info["slots"]["texture_base"]])
+    work = []
+    for i, (path, mode) in enumerate(jobs):
+        track = ruts.get(path, {}) if mode == "road" else {}
+        work.append((textures_dir, read_image, path, mode, f"r{i}", snow_rgb, track.get("us"), track.get("per_metre")))
     keys = {}
     with ProcessPoolExecutor() as pool:
-        for path, key, levels in pool.map(_bake_job, work):
+        for path, mode, key, levels in pool.map(_bake_job, work):
             if levels is None:
                 continue
+            target = packs.nature if mode == "tree" else packs.roads()
             for level, data in levels.items():
                 dds = f"/material/seasons/road/{key}_{level}.dds"
-                zf.writestr(dds[1:], data)
-                zf.writestr(baked_path(key, level)[1:], tex.write_tobj(dds))
-            keys[path] = key
-            if len(keys) % 50 == 0:
-                log(f"  road textures baked: {len(keys)}/{len(jobs)}")
-    log(f"road textures baked: {len(keys)} of {len(jobs)}, {Counter(j[1] for j in jobs)}")
+                target.writestr(dds[1:], data)
+                target.writestr(baked_path(key, level)[1:], tex.write_tobj(dds))
+            keys[path, mode] = key
+            if len(keys) % 100 == 0:
+                log(f"  textures baked: {len(keys)}/{len(jobs)}")
+    with_ruts = sum(1 for path, mode in keys if mode == "road" and path in ruts)
+    road_total = sum(1 for _path, mode in keys if mode == "road")
+    log(f"textures baked: {len(keys)} of {len(jobs)}, {dict(Counter(j[1] for j in jobs))}; "
+        f"road textures with wheel tracks from geometry: {with_ruts} of {road_total}")
     return keys
 
 
 def snowy_text(info, level, keys):
-    """A road material with snow baked into its surface textures."""
-    text = info["text"]
-    for path in info["slots"].values():
-        text = text.replace(f'"{path}"', f'"{baked_path(keys[path], level)}"')
-    return text
+    """A material with snow baked into its textures. `keys` gives a slot its baked texture."""
+    if level not in covers_for(info["mode"]):
+        return info["text"]
 
+    def swap(m):
+        key = keys.get(m.group(2))
+        return m.group(1) + baked_path(key, level) + m.group(4) if key else m.group(0)
 
-def tally(sector_list, positions, zones, looks):
-    """How often each look occurs in sectors that ever see snow."""
-    wanted = {struct.pack("<Q", tokens.encode(k)): k for k in looks}
-    counts = Counter()
-    for s in sector_list:
-        low = min(int(positions[s.name]), model.ZONE_COUNT - 2)
-        if low not in zones and low + 1 not in zones:
-            continue
-        data = sec.read_sector(s, "base")
-        if data:
-            for _p, name in find_refs(data, s, wanted):
-                counts[name] += 1
-    return counts
+    return _SLOT_BLOCK_RE.sub(swap, info["text"])
 
 
 def prefabs_known_by_name(files):
@@ -360,81 +504,13 @@ def load_prefabs(files):
     return without_prefabs(prefabs, prefabs_known_by_name(files))
 
 
-def find_prefab_refs(data, sector, wanted):
-    """Offsets of prefab model tokens in a sector's .base file: [(offset, token)].
-
-    A prefab item starts with its type and id, followed by its bounding box and then the model.
-    `wanted` is the set of model tokens; the type and the box tell real items from lookalikes.
-    """
-    arr = np.frombuffer(data, dtype=np.uint8)
-    if arr.size < PREFAB_MODEL_AT + 8:
-        return []
-    limit = arr.size - PREFAB_MODEL_AT - 8
-    starts = np.nonzero((arr[:limit] == PREFAB_ITEM) & (arr[1:limit + 1] == 0) & (arr[2:limit + 2] == 0) &
-                        (arr[3:limit + 3] == 0))[0]
-    size = 4000.0
-    x0, x1 = (sector.x - 1) * size, (sector.x + 2) * size
-    z0, z1 = (sector.z - 1) * size, (sector.z + 2) * size
-    refs = []
-    for start in starts.tolist():
-        p = start + PREFAB_MODEL_AT
-        value = struct.unpack_from("<Q", data, p)[0]
-        if value not in wanted:
-            continue
-        min_x, _y, min_z = struct.unpack_from("<3f", data, start + 12)
-        max_x, _y2, max_z = struct.unpack_from("<3f", data, start + 32)
-        if x0 <= min_x <= max_x <= x1 and z0 <= min_z <= max_z <= z1:
-            refs.append((p, value))
-    return refs
-
-
-def prefab_zone(data, p, zone_low, frac):
-    """The zone a prefab goes to, decided by the item's own bytes as with terrain tables."""
-    return zone_low + 1 if sec.content_choice(data, p - PREFAB_MODEL_AT, PREFAB_MODEL_AT, frac) else zone_low
-
-
-def patch_prefab_refs(original, patched, refs, zone_low, frac, index_of, zones):
-    """Swap prefab models for their zone copies in `patched`; returns (data, swaps)."""
-    out = bytearray(patched)
-    swapped = 0
-    for p, value in refs:
-        zone = prefab_zone(original, p, zone_low, frac)
-        index = index_of.get(value)
-        if index is None or zone not in zones:
-            continue
-        struct.pack_into("<Q", out, p, tokens.encode(prefab_name(zone, index)))
-        swapped += 1
-    return bytes(out), swapped
-
-
 def prefab_name(zone, index):
     return f"sp{zone}_{index}"
 
 
-def prefab_model_path(zone, index):
+def zone_model_path(root, zone, index):
     """Fixed width, so all the names of one shared archive entry have the same length."""
-    return f"/prefab_seasons/z{zone:02d}/m{index:05d}.pmd"
-
-
-def tally_prefabs(sector_list, positions, zones, prefabs):
-    """Which zones each prefab appears in: {name: set of zones}."""
-    by_token = {tokens.encode(k): k for k in prefabs}
-    wanted = set(by_token)
-    found = defaultdict(set)
-    for s in sector_list:
-        low = min(int(positions[s.name]), model.ZONE_COUNT - 2)
-        if low not in zones and low + 1 not in zones:
-            continue
-        data = sec.read_sector(s, "base")
-        if not data:
-            continue
-        frac = positions[s.name] - low
-        for p, value in find_prefab_refs(data, s, wanted):
-            zone = prefab_zone(data, p, low, frac)
-            if zone in zones:
-                found[by_token[value]].add(zone)
-    spread_over_links(found, prefabs)
-    return found
+    return f"/{root}/z{zone:02d}/m{index:05d}.pmd"
 
 
 def prefab_links(body):
@@ -465,10 +541,11 @@ def with_linked(names, prefabs):
     return out
 
 
-def copied_prefab(body, zone, model_paths, index_of):
-    """A prefab's body for one zone: its models and its links point to copies from that zone."""
-    body = _PREFAB_MODEL_RE.sub(lambda m: f'"{model_paths[m.group(1)]}"' if m.group(1) in model_paths else m.group(0),
-                                body)
+def copied_prefab(body, zone, model_paths, index_of, corners=None):
+    """A prefab's body for one zone: its models, links and corners point to copies from that zone."""
+    body = _ANY_MODEL_RE.sub(lambda m: f'"{model_paths[m.group(1)]}"' if m.group(1) in model_paths else m.group(0), body)
+    if corners:
+        body = _CORNER_RE.sub(lambda m: m.group(1) + corners.get(m.group(2), m.group(2)), body)
     return _PREFAB_LINK_RE.sub(lambda m: m.group(1) + prefab_name(zone, index_of[m.group(2)]), body)
 
 
@@ -494,132 +571,436 @@ def read_shared(zf, info):
     return zlib.decompress(data, -15) if info.compress_type else data
 
 
-def _write_prefabs(zf, files, prefab_zones, prefabs, model_mats, usable_paths, log):
-    """Copy the prefabs that have a snowy surface. Returns {prefab token: index}."""
-    model_zones = defaultdict(set)
-    for name, zones_here in prefab_zones.items():
-        for path in _PREFAB_MODEL_RE.findall(prefabs[name]):
-            if model_mats.get(path, set()) & usable_paths:
-                model_zones[path] |= zones_here
-    model_index = {path: i for i, path in enumerate(sorted(model_zones))}
-    entries = 0
-    for path, index in model_index.items():
-        raw, geometry = files.read(path), files.read(path[:-1] + "g")
-        collision = files.read(path[:-1] + "c")
-        swaps = model_mats[path] & usable_paths
-        first = None
-        for zone in sorted(model_zones[path]):
-            target = prefab_model_path(zone, index)[1:]
-            zf.writestr(target, patch_model(raw, {n: zone_material_path(n, zone) for n in swaps}))
-            if first is None:
-                first = target
-                zf.writestr(target[:-1] + "g", geometry)
-                if collision is not None:
-                    zf.writestr(target[:-1] + "c", collision)
+class Catalog:
+    """What's known about the game's materials, and which zones end up using which."""
+
+    def __init__(self, files, textures_dir):
+        self.files = files
+        self.textures_dir = textures_dir
+        self.info = {}
+        self.missing = set()
+        self.names = {}
+        self.geometry = {}
+
+    def learn(self, path):
+        """Learn a model's materials. Returns its bytes, or None if the model isn't complete."""
+        if path not in self.names:
+            raw = self.files.read(path)
+            if raw is None or self.files.read(path[:-1] + "g") is None:
+                self.names[path] = None
             else:
-                add_alias(zf, first[:-1] + "g", target[:-1] + "g")
-                if collision is not None:
-                    add_alias(zf, first[:-1] + "c", target[:-1] + "c")
-            entries += 1
-    log(f"prefab models: {len(model_index)}, copies for zones: {entries}")
+                names = {m.decode("ascii") for m in _MATERIAL_RE.findall(raw)}
+                self.names[path] = names
+                for name in names:
+                    if name not in self.info:
+                        self.info[name] = _material_info(self.files, name, self.textures_dir, self.missing)
+        return self.names[path]
 
-    chosen = sorted(with_linked((name for name in prefab_zones
-                                 if any(p in model_index for p in _PREFAB_MODEL_RE.findall(prefabs[name]))), prefabs))
-    index_of = {name: i for i, name in enumerate(chosen)}
-    token_index = {tokens.encode(name): i for name, i in index_of.items()}
-    defs = ["SiiNunit\n{\n"]
-    for name, i in index_of.items():
-        for zone in sorted(prefab_zones[name]):
-            paths = {path: prefab_model_path(zone, index) for path, index in model_index.items()
-                     if zone in model_zones[path]}
-            body = copied_prefab(prefabs[name], zone, paths, index_of)
-            defs.append(f"prefab_model : prefab.{prefab_name(zone, i)}\n{{{body}}}\n")
-    defs.append("}\n")
-    zf.writestr("def/world/prefab.ets_seasons.sii", "".join(defs))
-    log(f"prefabs with snow: {len(chosen)} of {len(prefab_zones)}, units: {len(defs) - 2}")
-    return token_index
+    def read_model(self, path):
+        """A model's material table and pieces, for working out where lanes lie."""
+        if self.learn(path) is None:
+            return None
+        return pmx.material_tables(self.files.read(path)), pmx.pieces(self.files.read(path[:-1] + "g"))
+
+    def usable(self):
+        return [info for info in self.info.values() if info]
 
 
-def build_into(zf, files, sector_list, positions, zones, textures_dir, read_image, log):
-    """Write looks, prefabs, models and textures into the map pack.
+class ModelCopies:
+    """Copies of models for zones, sharing their geometry in one archive."""
 
-    Returns ({look token: index}, {prefab token: index}, material records for the date pack).
-    """
+    def __init__(self, zf, files, catalog, usable_paths, used_by_zone, root):
+        self.zf = zf
+        self.files = files
+        self.catalog = catalog
+        self.usable_paths = usable_paths
+        self.used_by_zone = used_by_zone
+        self.root = root
+        self.index = {}
+        self.first = {}
+        self.written = set()
+
+    def copy(self, path, zone):
+        """The zone's copy of a model, or None when snow wouldn't change anything on it."""
+        names = self.catalog.learn(path)
+        swaps = (names or set()) & self.usable_paths
+        if not swaps:
+            return None
+        index = self.index.setdefault(path, len(self.index))
+        target = zone_model_path(self.root, zone, index)
+        if target in self.written:
+            return target
+        self.written.add(target)
+        for name in swaps:
+            self.used_by_zone[name].add(zone)
+        raw = self.files.read(path)
+        self.zf.writestr(target[1:], patch_model(raw, {n: zone_material_path(n, zone) for n in swaps}))
+        for ext in ("g", "c", "a"):
+            name = target[1:-1] + ext
+            if path not in self.first:
+                data = self.files.read(path[:-1] + ext)
+                if data is not None:
+                    self.zf.writestr(name, data)
+            else:
+                source = self.first[path][:-1] + ext
+                if source in self.zf.NameToInfo:
+                    add_alias(self.zf, source, name)
+        self.first.setdefault(path, target[1:])
+        return target
+
+    def copies(self, paths, zone):
+        out = {}
+        for path in paths:
+            target = self.copy(path, zone)
+            if target:
+                out[path] = target
+        return out
+
+
+def _tally_by_kind(tally):
+    """{kind: {token: set of zones}} and, for owned kinds, {kind: {(zone, token): owners}}."""
+    zones_of = defaultdict(lambda: defaultdict(set))
+    owners = defaultdict(lambda: defaultdict(set))
+    uses = defaultdict(Counter)
+    for (kind, zone, token, owner), count in tally.items():
+        zones_of[kind][token].add(zone)
+        uses[kind][token] += count
+        if owner:
+            owners[kind][zone, token].add(owner)
+    return zones_of, owners, uses
+
+
+def load_vocabulary(files):
+    """Everything that can be swapped on the map, by token. Returns (vocabulary, definitions)."""
     looks = load_looks(files)
-    counts = tally(sector_list, positions, set(zones), looks)
-    used = [looks[name] for name, _n in counts.most_common()]
-    log(f"road looks in snowy sectors: {len(used)} of {len(looks)}, references: {sum(counts.values())}")
     prefabs = load_prefabs(files)
-    prefab_zones = tally_prefabs(sector_list, positions, set(zones), prefabs)
-    log(f"prefabs in snowy sectors: {len(prefab_zones)} of {len(prefabs)}")
+    defs = {
+        "looks": looks,
+        "prefabs": prefabs,
+        "edges": load_units(files, "road_edge", "road_edge"),
+        "terrain_edges": load_units(files, "terrain_edge", "terrain_edge"),
+        "corners": load_units(files, "prefab_corner", "prefab_corner"),
+        "vegetation": load_units(files, "vegetation.", "vegetation_data"),
+        "vegetation_models": load_units(files, "vegetation_model", "vegetation_model", tokens_only=False),
+        "models": {k: v for k, v in load_units(files, "model", "model_def").items() if _NATURE_MODEL_RE.search(v[1])},
+        "curves": {k: v for k, v in load_units(files, "curve_model", "curve_model").items()
+                   if _NATURE_MODEL_RE.search(v[1])},
+        "far": load_units(files, "far_model", "far_model_def"),
+        "road_materials": load_units(files, "road_material", "road_material_def"),
+        "sidewalks": load_units(files, "road_sidewalk", "material_def"),
+    }
+    words = lambda names: {tokens.encode(k) for k in names}
+    vocab = zn.Vocabulary(
+        look=words(looks), legacy_look=words(k for k, v in looks.items() if not v.models),
+        edge=words(defs["edges"]), road_material=words(defs["road_materials"]),
+        prefab=words(prefabs), corner=words(defs["corners"]), vegetation=words(defs["vegetation"]),
+        sidewalk=words(defs["sidewalks"]), model=words(defs["models"]), curve=words(defs["curves"]),
+        far=words(defs["far"]), terrain_edge=words(defs["terrain_edges"]))
+    return vocab, defs
 
-    model_data = {}
-    material_info = {}
 
-    def learn_materials(raw):
-        names = {m.decode("ascii") for m in _MATERIAL_RE.findall(raw)}
-        for name in names:
-            if name not in material_info:
-                material_info[name] = _material_info(files, name, textures_dir)
-        return names
+def _names_by_token(names):
+    return {tokens.encode(k): k for k in names}
 
-    for look in used:
-        for path in look.models:
-            if path in model_data:
+
+def _write_unit_file(zf, name, units):
+    zf.writestr(name, "SiiNunit\n{\n" + "".join(units) + "}\n")
+
+
+def _simple_copies(defs, zones_of, models, kind_prefix, unit_kind):
+    """Copy units whose only outside references are their models. Returns (units, {(zone, token): new})."""
+    units, plan = [], {}
+    by_token = _names_by_token(defs)
+    ordered = sorted(zones_of.items(), key=lambda kv: by_token.get(kv[0], ""))
+    for index, (token, zones_here) in enumerate(ordered):
+        name = by_token.get(token)
+        if name is None:
+            continue
+        body = defs[name][1]
+        paths = _ANY_MODEL_RE.findall(body)
+        for zone in sorted(zones_here):
+            targets = models.copies(paths, zone)
+            if not targets:
                 continue
-            raw = files.read(path)
-            geometry = files.read(path[:-1] + "g")
-            if raw is None or geometry is None:
+            new = f"{kind_prefix}{zone}_{index}"
+            units.append(f"{unit_kind} : {defs[name][0].split('.', 1)[0]}.{new}\n{{"
+                         + _ANY_MODEL_RE.sub(lambda m: f'"{targets.get(m.group(1), m.group(1))}"', body) + "}\n")
+            plan[zone, token] = tokens.encode(new)
+    return units, plan
+
+
+def _learn_all(catalog, defs, zones_of):
+    """Find the materials of everything that's on a snowy part of the map."""
+    for look_token in zones_of["look"]:
+        name = _names_by_token(defs["looks"]).get(look_token)
+        if name:
+            for path in defs["looks"][name].models:
+                catalog.learn(path)
+    for kind, table in (("edge", "edges"), ("terrain_edge", "terrain_edges"), ("corner", "corners"),
+                        ("model", "models"), ("curve", "curves"), ("far", "far")):
+        by_token = _names_by_token(defs[table])
+        for token in zones_of[kind]:
+            name = by_token.get(token)
+            if name:
+                for path in _ANY_MODEL_RE.findall(defs[table][name][1]):
+                    catalog.learn(path)
+    by_token = _names_by_token(defs["prefabs"])
+    for token in zones_of["prefab"]:
+        name = by_token.get(token)
+        if name:
+            for path in _ANY_MODEL_RE.findall(defs["prefabs"][name]):
+                catalog.learn(path)
+    veg_models = defs["vegetation_models"]
+    by_token = _names_by_token(defs["vegetation"])
+    for token in zones_of["vegetation"]:
+        name = by_token.get(token)
+        if name:
+            for model in _VEGETATION_MODEL_RE.findall(defs["vegetation"][name][1]):
+                short = model[1].split(".", 1)[1]
+                if short in veg_models:
+                    for path in _ANY_MODEL_RE.findall(veg_models[short][1]):
+                        catalog.learn(path)
+
+
+def _write_vegetation(zf, defs, zones_of, models, log):
+    """Per-zone vegetation schemes and their tree models. Returns the plan for vegetation tokens."""
+    by_token = _names_by_token(defs["vegetation"])
+    veg_models = defs["vegetation_models"]
+    model_index = {name: i for i, name in enumerate(sorted(veg_models))}
+    units, model_units, plan, copied = [], [], {}, {}
+
+    def tree_copy(short, zone):
+        """The name of a tree model's unit for a zone, or None."""
+        key = zone, short
+        if key not in copied:
+            body = veg_models[short][1]
+            targets = models.copies(_ANY_MODEL_RE.findall(body), zone)
+            if targets:
+                new = f"vm{zone}_{model_index[short]}"
+                model_units.append(f"vegetation_model : vegetmodel.{new}\n{{"
+                                   + _ANY_MODEL_RE.sub(lambda m: f'"{targets.get(m.group(1), m.group(1))}"', body)
+                                   + "}\n")
+                copied[key] = f"vegetmodel.{new}"
+            else:
+                copied[key] = None
+        return copied[key]
+
+    for index, (token, zones_here) in enumerate(sorted(zones_of["vegetation"].items())):
+        name = by_token.get(token)
+        if name is None:
+            continue
+        body = defs["vegetation"][name][1]
+        for zone in sorted(zones_here):
+            changed = []
+
+            def swap(m):
+                short = m.group(2).split(".", 1)[1]
+                new = tree_copy(short, zone) if short in veg_models else None
+                if new:
+                    changed.append(new)
+                return m.group(1) + (new or m.group(2))
+
+            new_body = _VEGETATION_MODEL_RE.sub(swap, body)
+            if changed:
+                new = f"vz{zone}_{index}"
+                units.append(f"vegetation_data : veg.{new}\n{{{new_body}}}\n")
+                plan[zone, token] = tokens.encode(new)
+    _write_unit_file(zf, "def/world/vegetation_model.ets_seasons.sii", model_units)
+    _write_unit_file(zf, "def/world/vegetation.ets_seasons.sii", units)
+    log(f"vegetation schemes: {len(units)}, tree models: {len(model_units)}, model copies: {len(models.written)}")
+    return plan
+
+
+def _write_legacy(zf, defs, zones_of, catalog, log):
+    """Roads from before templates name their materials themselves. Returns (plan, records)."""
+    records = {}
+
+    def record(path):
+        if path not in records:
+            info = _material_info(catalog.files, path, catalog.textures_dir, catalog.missing)
+            records[path] = None if info is None else {**info, "legacy": len(records), "zones": set()}
+        return records[path]
+
+    plans = {}
+    for kind, table, prefix, namespace, unit, filename in (
+            ("road_material", "road_materials", "lm", "road_mat", "road_material_def",
+             "def/world/road_material.ets_seasons.sii"),
+            ("sidewalk", "sidewalks", "ls", "sidewalk", "material_def", "def/world/road_sidewalk.ets_seasons.sii")):
+        by_token = _names_by_token(defs[table])
+        units, plan = [], {}
+        for index, (token, zones_here) in enumerate(sorted(zones_of[kind].items())):
+            name = by_token.get(token)
+            if name is None:
                 continue
-            model_data[path] = (raw, geometry)
-            learn_materials(raw)
-    prefab_model_mats = {}
-    for name in prefab_zones:
-        for path in _PREFAB_MODEL_RE.findall(prefabs[name]):
-            if path not in prefab_model_mats:
-                raw = files.read(path)
-                if raw is not None and files.read(path[:-1] + "g") is not None:
-                    prefab_model_mats[path] = learn_materials(raw)
-    usable = [info for info in material_info.values() if info]
-    log(f"road models: {len(model_data)}, prefab models: {len(prefab_model_mats)}, "
-        f"surface materials: {len(usable)} of {len(material_info)}")
+            body = defs[table][name][1]
+            found = [record(m.group(2)) for m in _MATERIAL_PATH_RE.finditer(body)]
+            if not any(found):
+                continue
+            for zone in sorted(zones_here):
+                def swap(m):
+                    info = records.get(m.group(2))
+                    if info is None:
+                        return m.group(0)
+                    info["zones"].add(zone)
+                    return m.group(1) + legacy_material_path(info["legacy"], zone) + m.group(3)
 
-    keys = _bake_textures(usable, zf, textures_dir, read_image, log)
-    usable = [i for i in usable if all(p in keys for p in i["slots"].values())]
-    usable_paths = {i["path"] for i in usable}
-    prefab_index = _write_prefabs(zf, files, prefab_zones, prefabs, prefab_model_mats, usable_paths, log)
+                new = f"{prefix}{zone}_{index}"
+                units.append(f"{unit} : {namespace}.{new}\n{{{_MATERIAL_PATH_RE.sub(swap, body)}}}\n")
+                plan[zone, token] = tokens.encode(new)
+        _write_unit_file(zf, filename, units)
+        plans[kind] = plan
+    used = [info for info in records.values() if info and info["zones"]]
+    log(f"old road materials: {len(used)}, units: {sum(len(p) for p in plans.values())}")
+    return plans, used
 
-    model_index = {}
-    for path, (raw, _geometry) in model_data.items():
-        names = {m.decode("ascii") for m in _MATERIAL_RE.findall(raw)}
-        if names & usable_paths:
-            model_index[path] = (len(model_index), sorted(names & usable_paths))
-    for zone in zones:
-        for path, (index, names) in model_index.items():
-            raw, geometry = model_data[path]
-            target = zone_model_path(zone, index)
-            swaps = {n: zone_material_path(n, zone) for n in names}
-            zf.writestr(target[1:], patch_model(raw, swaps))
-            zf.writestr(target[1:-1] + "g", geometry)
-    log(f"road models copied: {len(model_index)} for each of {len(zones)} zones")
 
-    chosen = [look for look in used if any(p in model_index for p in look.models)]
-    defs = ["SiiNunit\n{\n"]
-    token_index = {}
-    for i, look in enumerate(chosen):
-        token_index[tokens.encode(look.name)] = i
-        for zone in zones:
-            models = {p: zone_model_path(zone, model_index[p][0]) for p in look.models if p in model_index}
-            defs.append(rename_look(look, variant_name(zone, i), models))
-    defs.append("}\n")
-    zf.writestr("def/world/road_look.ets_seasons.sii", "".join(defs))
-    records = [{**info, "keys": {p: keys[p] for p in info["slots"].values()}} for info in usable]
-    log(f"road looks with snow: {len(chosen)}")
-    return token_index, prefab_index, records
+def _write_prefabs(zf, defs, zones_of, owners, models, log):
+    """Copy the prefabs and their corners. Returns the plans for both."""
+    prefabs = defs["prefabs"]
+    by_token = _names_by_token(prefabs)
+    found = defaultdict(set)
+    for token, zones_here in zones_of["prefab"].items():
+        if token in by_token:
+            found[by_token[token]] |= zones_here
+    spread_over_links(found, prefabs)
+    model_paths = {}
+    for name, zones_here in found.items():
+        for zone in zones_here:
+            model_paths[name, zone] = models.copies(_ANY_MODEL_RE.findall(prefabs[name]), zone)
+    wanted = [name for name in found if any(model_paths.get((name, z)) for z in found[name])]
+    chosen = sorted(with_linked(wanted, prefabs))
+    index_of = {name: i for i, name in enumerate(chosen)}
+    plan = {}
+    for name in chosen:
+        for zone in found[name]:
+            plan[zone, tokens.encode(name)] = tokens.encode(prefab_name(zone, index_of[name]))
+
+    # Only corners of prefabs that have a copy can be swapped, since a stock prefab wouldn't list them.
+    corner_tokens = _names_by_token(defs["corners"])
+    corner_plan, corner_units, corners_of = {}, [], defaultdict(dict)
+    for index, ((zone, token), owning) in enumerate(sorted(owners["corner"].items())):
+        name = corner_tokens.get(token)
+        if name is None or not any((zone, owner) in plan for owner in owning):
+            continue
+        body = defs["corners"][name][1]
+        targets = models.copies(_ANY_MODEL_RE.findall(body), zone)
+        if not targets:
+            continue
+        new = f"cz{zone}_{index}"
+        corner_units.append(f"prefab_corner : corner.{new}\n{{"
+                            + _ANY_MODEL_RE.sub(lambda m: f'"{targets.get(m.group(1), m.group(1))}"', body) + "}\n")
+        corner_plan[zone, token] = tokens.encode(new)
+        corners_of[zone][name] = new
+    _write_unit_file(zf, "def/world/prefab_corner.ets_seasons.sii", corner_units)
+
+    units = []
+    for name in chosen:
+        for zone in sorted(found[name]):
+            body = copied_prefab(prefabs[name], zone, model_paths.get((name, zone)) or {}, index_of, corners_of[zone])
+            units.append(f"prefab_model : prefab.{prefab_name(zone, index_of[name])}\n{{{body}}}\n")
+    _write_unit_file(zf, "def/world/prefab.ets_seasons.sii", units)
+    log(f"prefabs with snow: {len(chosen)} of {len(found)}, units: {len(units)}, corners: {len(corner_units)}")
+    return plan, corner_plan
+
+
+def _write_roads(zf, defs, zones_of, models, log):
+    """Copy road edges and looks. Returns the plans for both."""
+    edge_units, edge_plan = _simple_copies(defs["edges"], zones_of["edge"], models, "ez", "road_edge")
+    _write_unit_file(zf, "def/world/road_edge.ets_seasons.sii", edge_units)
+    edge_tokens = _names_by_token(defs["edges"])
+    edge_names = defaultdict(dict)
+    for (zone, token), new in edge_plan.items():
+        edge_names[zone][edge_tokens[token]] = tokens.decode(new)
+
+    looks = defs["looks"]
+    by_token = _names_by_token(looks)
+    units, plan = [], {}
+    for index, (token, zones_here) in enumerate(sorted(zones_of["look"].items())):
+        name = by_token.get(token)
+        if name is None or not looks[name].models:
+            continue
+        for zone in sorted(zones_here):
+            targets = models.copies(looks[name].models, zone)
+            if not targets and not edge_names[zone]:
+                continue
+            new = variant_name(zone, index)
+            units.append(rename_look(looks[name], new, targets, edge_names[zone]))
+            plan[zone, token] = tokens.encode(new)
+    _write_unit_file(zf, "def/world/road_look.ets_seasons.sii", units)
+    log(f"road looks: {len(plan)} copies of {len(zones_of['look'])}, edges: {len(edge_units)}")
+    return plan, edge_plan
+
+
+def build_into(packs, files, vocab, defs, tally, textures_dir, read_image, log):
+    """Write all per-zone copies into the packs. Returns (plan for sectors, material records)."""
+    zones_of, owners, uses = _tally_by_kind(tally)
+    catalog = Catalog(files, textures_dir)
+    _learn_all(catalog, defs, zones_of)
+    usable = catalog.usable()
+    log(f"materials on the snowy map: {len(catalog.info)}, can take snow: {len(usable)}, "
+        f"{dict(Counter(i['mode'] for i in usable))}")
+    if catalog.missing:
+        log(f"materials left out, textures not extracted: {len(catalog.missing)}, e.g. {sorted(catalog.missing)[:3]}")
+
+    used_looks = [defs["looks"][name] for token, name in _names_by_token(defs["looks"]).items()
+                  if token in zones_of["look"]]
+    look_counts = {tokens.decode(token): n for token, n in uses["look"].items()}
+    ruts = road_ruts(used_looks, look_counts, catalog.read_model, catalog.info.get)
+    # Old roads use their own materials, which get wheel tracks from the look's standard layout.
+    legacy_plans, legacy_records = _write_legacy(packs.map, defs, zones_of, catalog, log)
+    for info in legacy_records:
+        if info["mode"] == "road":
+            ruts.setdefault(info["slots"]["texture_base"], LEGACY_RUTS)
+
+    keys = _bake_textures(usable + legacy_records, packs, textures_dir, read_image, ruts, log)
+    complete = lambda info: all((path, slot_mode(info, slot)) in keys for slot, path in info["slots"].items())
+    usable = [info for info in usable if complete(info)]
+    usable_paths = {info["path"] for info in usable}
+    used_by_zone = defaultdict(set)
+
+    surface = ModelCopies(packs.map, files, catalog, usable_paths, used_by_zone, "prefab_seasons")
+    plan = defaultdict(dict)
+    plan["look"], plan["edge"] = _write_roads(packs.map, defs, zones_of, surface, log)
+    plan["prefab"], plan["corner"] = _write_prefabs(packs.map, defs, zones_of, owners, surface, log)
+    edge_units, plan["terrain_edge"] = _simple_copies(defs["terrain_edges"], zones_of["terrain_edge"], surface, "tz",
+                                                      "terrain_edge")
+    _write_unit_file(packs.map, "def/world/terrain_edge.ets_seasons.sii", edge_units)
+    log(f"model copies on roads: {len(surface.written)} of {len(surface.index)} models")
+
+    nature = ModelCopies(packs.nature, files, catalog, usable_paths, used_by_zone, "veg_seasons")
+    plan["vegetation"] = _write_vegetation(packs.map, defs, zones_of, nature, log)
+    for kind, table, prefix, unit, filename in (("model", "models", "mz", "model_def", "model"),
+                                                ("curve", "curves", "cv", "curve_model", "curve_model"),
+                                                ("far", "far", "fz", "far_model_def", "far_model")):
+        units, plan[kind] = _simple_copies(defs[table], zones_of[kind], nature, prefix, unit)
+        _write_unit_file(packs.map, f"def/world/{filename}.ets_seasons.sii", units)
+        log(f"{kind} copies: {len(units)}")
+    log(f"model copies in nature: {len(nature.written)} of {len(nature.index)} models")
+    plan.update(legacy_plans)
+
+    records = []
+    for info in usable:
+        zones_here = used_by_zone.get(info["path"])
+        if zones_here:
+            records.append(_record(info, keys, zones_here))
+    # A unit of an old road already points to these, so they stay even if a texture couldn't be baked.
+    records += [_record(info, keys, info["zones"]) for info in legacy_records]
+    log(f"materials in use: {len(records)}, files for the date pack: {sum(len(r['zones']) for r in records)}")
+    return plan, records
+
+
+def _record(info, keys, zones_here):
+    baked = {slot: keys.get((path, slot_mode(info, slot))) for slot, path in info["slots"].items()}
+    return {**info, "zones": sorted(zones_here), "keys": {slot: key for slot, key in baked.items() if key}}
 
 
 def date_files(records, zone, level):
     """Yield (zip path, material text) for one zone at one snow level."""
     for info in records:
-        target = zone_material_path(info["path"], zone).lstrip("/")
+        if zone not in info["zones"]:
+            continue
+        if "legacy" in info:
+            target = legacy_material_path(info["legacy"], zone).lstrip("/")
+        else:
+            target = zone_material_path(info["path"], zone).lstrip("/")
         yield target, info["text"] if level == 0 else snowy_text(info, level, info["keys"])
